@@ -3,8 +3,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QTextCursor
+from PySide6.QtCore import Qt, QMimeData, QThread, Signal
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -71,6 +71,7 @@ class MainWindow(QWidget):
         super().__init__()
         self.setWindowTitle("视频转换器")
         self.resize(800, 600)
+        self.setAcceptDrops(True)
 
         self._files_list = QListWidget()
         self._output_edit = QLineEdit()
@@ -322,6 +323,42 @@ class MainWindow(QWidget):
                 if candidate.exists():
                     return candidate
         return home
+
+    # 拖拽处理
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
+        if self._contains_valid_urls(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
+        urls = event.mimeData().urls()
+        paths = []
+        for url in urls:
+            local_path = Path(url.toLocalFile())
+            if local_path.is_dir():
+                paths.extend(p for p in local_path.rglob("*") if p.is_file())
+            else:
+                paths.append(local_path)
+
+        video_paths = [p for p in paths if p.suffix.lower() in VIDEO_EXTENSIONS]
+        if video_paths:
+            self._add_paths(video_paths)
+            event.acceptProposedAction()
+        else:
+            self._append_log("拖拽内容未包含可支持的视频文件")
+            event.ignore()
+
+    def _contains_valid_urls(self, mime_data: QMimeData) -> bool:
+        if not mime_data.hasUrls():
+            return False
+        for url in mime_data.urls():
+            path = Path(url.toLocalFile())
+            if path.is_dir():
+                return True
+            if path.suffix.lower() in VIDEO_EXTENSIONS:
+                return True
+        return False
 
 
 def main() -> int:
