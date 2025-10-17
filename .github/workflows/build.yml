@@ -1,0 +1,104 @@
+name: Build Desktop Apps
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+
+jobs:
+  macos:
+    name: macOS App Bundle
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
+      - name: Prepare bundled ffmpeg
+        run: |
+          mkdir -p resources/ffmpeg/macos
+          cp "$(brew --prefix ffmpeg)/bin/ffmpeg" resources/ffmpeg/macos/ffmpeg
+          cp "$(brew --prefix ffmpeg)/bin/ffprobe" resources/ffmpeg/macos/ffprobe
+
+      - name: Build macOS app bundle
+        run: make build-mac
+
+      - name: Package artifact
+        run: |
+          cd dist
+          zip -r video-converter-macos.zip video-converter.app
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-converter-macos
+          path: dist/video-converter-macos.zip
+
+  windows:
+    name: Windows Executable
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install ffmpeg
+        run: choco install ffmpeg --no-progress -y
+        shell: powershell
+
+      - name: Prepare bundled ffmpeg
+        shell: powershell
+        run: |
+          $ffmpegDir = (Get-ChildItem 'C:\ProgramData\chocolatey\lib\ffmpeg\tools' -Recurse -Filter 'ffmpeg.exe' | Select-Object -First 1).DirectoryName
+          if (-not $ffmpegDir) { throw 'ffmpeg binary not found' }
+          New-Item -ItemType Directory -Force -Path "resources\ffmpeg\windows" | Out-Null
+          Copy-Item "$ffmpegDir\ffmpeg.exe" "resources\ffmpeg\windows\ffmpeg.exe" -Force
+          Copy-Item "$ffmpegDir\ffprobe.exe" "resources\ffmpeg\windows\ffprobe.exe" -Force
+
+      - name: Build Windows executable
+        shell: powershell
+        run: |
+          pyinstaller --noconfirm --clean --windowed `
+            --name video-converter `
+            --add-data "resources\ffmpeg\windows\ffmpeg.exe;resources/ffmpeg/windows" `
+            --add-data "resources\ffmpeg\windows\ffprobe.exe;resources/ffmpeg/windows" `
+            src\main.py
+
+      - name: Package artifact
+        shell: powershell
+        run: |
+          Compress-Archive -Path "dist\video-converter\*" -DestinationPath "dist\video-converter-windows.zip"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-converter-windows
+          path: dist/video-converter-windows.zip
+

@@ -17,11 +17,9 @@ build-win:
 	@echo "请在 Windows 环境下执行打包命令"
 
 build-mac: install
-	$(PYTHON) -m PyInstaller --noconfirm --clean \
+	$(PYTHON) -m PyInstaller --noconfirm --clean --windowed \
 		--name video-converter \
-		--add-data "resources/ffmpeg/windows/ffmpeg.exe$(DATA_SEP)resources/ffmpeg/windows" \
-		--add-data "resources/ffmpeg/windows/ffprobe.exe$(DATA_SEP)resources/ffmpeg/windows" \
-		--add-data "resources/ffmpeg/windows/ffplay.exe$(DATA_SEP)resources/ffmpeg/windows" \
+		--osx-bundle-identifier "com.example.videoconverter" \
 		--add-data "resources/ffmpeg/macos/ffmpeg$(DATA_SEP)resources/ffmpeg/macos" \
 		--add-data "resources/ffmpeg/macos/ffprobe$(DATA_SEP)resources/ffmpeg/macos" \
 		src/main.py
