@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import threading
+import re
 import sys
+import time
 from pathlib import Path
+from typing import Iterable, List, NamedTuple, Optional
 
 from PySide6.QtCore import Qt, QMimeData, QThread, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QTextCursor
@@ -17,6 +21,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -24,9 +29,13 @@ from PySide6.QtWidgets import (
 )
 
 from converter import (
+    ConversionProgress,
     ConversionRequest,
+    ConversionTask,
     ConverterError,
+    ControlSignals,
     convert_files,
+    probe_image_metadata,
     probe_video_metadata,
 )
 
@@ -39,31 +48,71 @@ QUALITY_OPTIONS = [
 ]
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mpg", ".mpeg"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+SUPPORTED_EXTENSIONS = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS
+
+
+class SequenceInfo(NamedTuple):
+    pattern: str
+    first_frame: Path
+    extension: str
+    start_number: int
+    frame_count: int
+    prefix: str
+    padding: int
 
 
 class ConversionWorker(QThread):
-    progress_signal = Signal(str)
+    progress_signal = Signal(object)
     log_signal = Signal(str)
     error_signal = Signal(str)
     finished_signal = Signal()
+    paused_signal = Signal(bool)
 
     def __init__(self, request: ConversionRequest):
         super().__init__()
         self._request = request
+        self._signals = ControlSignals()
+        self._signals.pause_event.set()
+        self._pause_btn_state = False
+
+    def pause(self) -> None:
+        self._signals.request_pause()
+        self.paused_signal.emit(True)
+
+    def resume(self) -> None:
+        self._signals.request_resume()
+        self.paused_signal.emit(False)
+
+    def cancel(self, reason: str | None = None) -> None:
+        self._signals.request_cancel(reason)
 
     def run(self) -> None:  # pragma: no cover - UI thread
         try:
+            self._request.signals = self._signals
             convert_files(
                 self._request,
-                progress=self.progress_signal.emit,
+                progress=self._forward_progress,
                 log=self.log_signal.emit,
             )
+        except ConversionCancelled:
+            self.log_signal.emit("转换已被终止")
         except ConverterError as exc:
             self.error_signal.emit(str(exc))
         except Exception as exc:  # noqa: BLE001
             self.error_signal.emit(str(exc))
         finally:
             self.finished_signal.emit()
+
+    def _forward_progress(self, progress: ConversionProgress) -> None:
+        while (
+            not self._signals.pause_event.is_set()
+            and not self._signals.cancel_event.is_set()
+        ):
+            time.sleep(0.1)
+        if self._signals.cancel_event.is_set():
+            raise ConversionCancelled
+        self.progress_signal.emit(progress)
 
 
 class MainWindow(QWidget):
@@ -84,17 +133,32 @@ class MainWindow(QWidget):
         self._quality_combo.setCurrentIndex(1)  # 默认“中等”
         self._log_view = QTextEdit()
         self._log_view.setReadOnly(True)
+        self._overall_progress = QProgressBar()
+        self._current_progress = QProgressBar()
+        self._elapsed_label = QLabel("总耗时: --")
+        for bar in (self._overall_progress, self._current_progress):
+            bar.setRange(0, 100)
+            bar.setValue(0)
 
         self._add_files_btn = QPushButton("添加视频")
         self._add_folder_btn = QPushButton("添加文件夹")
         self._clear_files_btn = QPushButton("清空")
         self._browse_output_btn = QPushButton("选择输出目录")
         self._start_btn = QPushButton("开始转换")
+        self._pause_btn = QPushButton("暂停")
+        self._resume_btn = QPushButton("继续")
+        self._cancel_btn = QPushButton("终止")
         self._start_btn.setEnabled(False)
+        self._pause_btn.setEnabled(True)
+        self._resume_btn.setEnabled(False)
+        self._cancel_btn.setEnabled(True)
 
         self._worker: ConversionWorker | None = None
-        self._file_set: set[Path] = set()
+        self._file_set: set[str] = set()
+        self._tasks: list[ConversionTask] = []
         self._defaults_applied = False
+        self._start_time: float | None = None
+        self._was_cancelled: bool = False
 
         self._setup_ui()
         self._bind_events()
@@ -130,13 +194,25 @@ class MainWindow(QWidget):
 
         log_group = QGroupBox("日志")
         log_layout = QVBoxLayout()
+        log_layout.addWidget(QLabel("整体进度"))
+        log_layout.addWidget(self._overall_progress)
+        log_layout.addWidget(QLabel("当前文件进度"))
+        log_layout.addWidget(self._current_progress)
+        log_layout.addWidget(self._elapsed_label)
         log_layout.addWidget(self._log_view)
         log_group.setLayout(log_layout)
+
+        control_layout = QHBoxLayout()
+        control_layout.addWidget(self._start_btn)
+        control_layout.addWidget(self._pause_btn)
+        control_layout.addWidget(self._resume_btn)
+        control_layout.addWidget(self._cancel_btn)
+        control_layout.addStretch()
 
         main_layout.addWidget(files_group)
         main_layout.addWidget(settings_group)
         main_layout.addWidget(log_group)
-        main_layout.addWidget(self._start_btn, alignment=Qt.AlignmentFlag.AlignRight)
+        main_layout.addLayout(control_layout)
 
     def _bind_events(self) -> None:
         self._add_files_btn.clicked.connect(self._on_add_files)  # type: ignore[arg-type]
@@ -144,6 +220,9 @@ class MainWindow(QWidget):
         self._clear_files_btn.clicked.connect(self._on_clear_files)  # type: ignore[arg-type]
         self._browse_output_btn.clicked.connect(self._on_browse_output)  # type: ignore[arg-type]
         self._start_btn.clicked.connect(self._on_start)  # type: ignore[arg-type]
+        self._pause_btn.clicked.connect(self._on_pause)  # type: ignore[arg-type]
+        self._resume_btn.clicked.connect(self._on_resume)  # type: ignore[arg-type]
+        self._cancel_btn.clicked.connect(self._on_cancel)  # type: ignore[arg-type]
 
     def _on_add_files(self) -> None:  # pragma: no cover - UI
         paths, _ = QFileDialog.getOpenFileNames(
@@ -158,10 +237,15 @@ class MainWindow(QWidget):
     def _on_clear_files(self) -> None:
         self._files_list.clear()
         self._file_set.clear()
+        self._tasks.clear()
         self._defaults_applied = False
         self._width_edit.clear()
         self._height_edit.clear()
         self._fps_edit.clear()
+        self._overall_progress.setValue(0)
+        self._current_progress.setValue(0)
+        self._elapsed_label.setText("总耗时: --")
+        self._set_controls_stopped()
         self._update_start_state()
 
     def _on_browse_output(self) -> None:
@@ -177,15 +261,7 @@ class MainWindow(QWidget):
 
         folder_path = Path(directory)
         paths = (path for path in folder_path.rglob("*") if path.is_file())
-        video_paths = [p for p in paths if p.suffix.lower() in VIDEO_EXTENSIONS]
-
-        if not video_paths:
-            QMessageBox.information(
-                self, "提示", "选定的文件夹中没有找到支持的视频文件"
-            )
-            return
-
-        self._add_paths(video_paths)
+        self._add_paths(paths)
 
     def _update_start_state(self) -> None:
         has_files = self._files_list.count() > 0
@@ -195,6 +271,15 @@ class MainWindow(QWidget):
     def _append_log(self, message: str) -> None:
         self._log_view.append(message)
         self._log_view.moveCursor(QTextCursor.End)
+
+    def _on_progress(self, progress: ConversionProgress) -> None:
+        overall_percent = int(min(max(progress.overall_progress * 100, 0), 100))
+        task_percent = int(min(max(progress.task_progress * 100, 0), 100))
+        self._overall_progress.setValue(overall_percent)
+        self._current_progress.setValue(task_percent)
+        self._append_log(
+            f"[{progress.task_index}/{progress.total_tasks}] {progress.task_name} - {progress.stage} ({task_percent}%)"
+        )
 
     def _on_start(self) -> None:
         try:
@@ -206,29 +291,47 @@ class MainWindow(QWidget):
         self._log_view.clear()
         self._append_log("开始转换...")
         self._start_btn.setEnabled(False)
+        self._pause_btn.setEnabled(True)
+        self._resume_btn.setEnabled(False)
+        self._cancel_btn.setEnabled(True)
 
+        self._start_time = time.perf_counter()
+        self._was_cancelled = False
+
+        self._overall_progress.setValue(0)
+        self._current_progress.setValue(0)
         self._worker = ConversionWorker(request)
-        self._worker.progress_signal.connect(self._append_log)
+        self._worker.progress_signal.connect(self._on_progress)
         self._worker.log_signal.connect(self._append_log)
         self._worker.error_signal.connect(self._on_error)
         self._worker.finished_signal.connect(self._on_finished)
+        self._worker.paused_signal.connect(self._on_worker_paused)
         self._worker.start()
+        self._pause_btn.setEnabled(True)
+        self._resume_btn.setEnabled(False)
+        self._cancel_btn.setEnabled(True)
 
     def _on_error(self, message: str) -> None:
         self._append_log(f"❌ {message}")
-        QMessageBox.critical(self, "转换失败", message)
+        if not self._was_cancelled:
+            QMessageBox.critical(self, "转换失败", message)
+        self._set_controls_stopped()
 
     def _on_finished(self) -> None:
-        self._append_log("✅ 转换完成")
+        elapsed = "--"
+        if self._start_time is not None:
+            elapsed_seconds = time.perf_counter() - self._start_time
+            elapsed = f"{elapsed_seconds:.2f} 秒"
+        self._elapsed_label.setText(f"总耗时: {elapsed}")
+        if self._was_cancelled:
+            self._append_log("⚠️ 转换已终止")
+        else:
+            self._append_log("✅ 转换完成")
         self._worker = None
-        self._update_start_state()
+        self._set_controls_stopped()
+        self._was_cancelled = False
 
     def _build_request(self) -> ConversionRequest:
-        files = [
-            Path(self._files_list.item(index).text())
-            for index in range(self._files_list.count())
-        ]
-
         output_dir = Path(self._output_edit.text()).expanduser()
         if not output_dir:
             raise ConverterError("请指定输出目录")
@@ -246,7 +349,7 @@ class MainWindow(QWidget):
         quality = self._quality_combo.currentData()
 
         return ConversionRequest(
-            input_files=files,
+            tasks=self._tasks,
             output_dir=output_dir,
             width=width,
             height=height,
@@ -255,40 +358,186 @@ class MainWindow(QWidget):
         )
 
     def _add_paths(self, paths: Iterable[Path]) -> None:
-        new_paths = []
+        new_tasks: list[ConversionTask] = []
         for path in paths:
             normalized = path.resolve()
-            if normalized in self._file_set:
-                continue
             if not normalized.exists():
                 continue
-            if normalized.suffix.lower() not in VIDEO_EXTENSIONS:
-                continue
-            self._file_set.add(normalized)
-            new_paths.append(normalized)
 
-        if not new_paths:
-            self._append_log("未添加新的视频文件")
+            suffix = normalized.suffix.lower()
+            key = str(normalized)
+
+            if suffix in VIDEO_EXTENSIONS:
+                if key in self._file_set:
+                    continue
+                try:
+                    width, height, fps, frames, duration = probe_video_metadata(
+                        normalized
+                    )
+                except ConverterError as exc:
+                    self._append_log(f"⚠️ 无法读取 {normalized.name} 的参数：{exc}")
+                    continue
+                task = ConversionTask(
+                    display_name=normalized.name,
+                    source=normalized,
+                    output_stem=normalized.stem,
+                    total_frames=frames,
+                    duration_ms=duration,
+                )
+                self._file_set.add(key)
+                new_tasks.append(task)
+                continue
+
+            if suffix in IMAGE_EXTENSIONS:
+                sequence = self._detect_sequence(normalized)
+                if sequence:
+                    sequence_key = sequence.pattern
+                    if sequence_key in self._file_set:
+                        continue
+                    task = self._build_sequence_task(sequence)
+                    if task:
+                        task.frame_count = sequence.frame_count
+                        task.duration_ms = sequence.frame_count * 150
+                        self._file_set.add(sequence_key)
+                        new_tasks.append(task)
+                    continue
+
+                if key in self._file_set:
+                    continue
+                task = ConversionTask(
+                    display_name=normalized.name,
+                    source=normalized,
+                    output_stem=normalized.stem,
+                    is_sequence=True,
+                    sequence_pattern=str(normalized),
+                    frame_extension=suffix,
+                    frame_count=1,
+                    first_frame=normalized,
+                    start_number=0,
+                    duration_ms=150,
+                )
+                self._file_set.add(key)
+                new_tasks.append(task)
+
+        if not new_tasks:
+            self._append_log("未添加新的可转换文件")
             return
 
-        for path in sorted(new_paths):
-            item = QListWidgetItem(str(path))
-            item.setToolTip(str(path))
+        for task in new_tasks:
+            item = QListWidgetItem(task.display_name)
+            tooltip_parts = [f"输出: {task.output_stem}"]
+            tooltip_parts.append(task.sequence_pattern or str(task.source))
+            if task.total_frames:
+                tooltip_parts.append(f"帧数: {task.total_frames}")
+            if task.duration_ms:
+                tooltip_parts.append(f"时长: {task.duration_ms / 1000:.2f}s")
+            item.setToolTip(" | ".join(tooltip_parts))
+            item.setData(Qt.ItemDataRole.UserRole, task)
             self._files_list.addItem(item)
+            self._tasks.append(task)
 
         self._update_start_state()
         self._apply_defaults_if_needed()
-        self._append_log(f"已添加 {len(new_paths)} 个视频文件")
+        self._append_log(f"已添加 {len(new_tasks)} 个任务")
+
+    def _detect_sequence(self, frame_path: Path) -> SequenceInfo | None:
+        match = re.match(r"(.*?)(\d+)(\.[^.]+)$", frame_path.name)
+        if not match:
+            return None
+
+        prefix, number_str, extension = match.groups()
+        padding = len(number_str)
+        directory = frame_path.parent
+        regex = re.compile(rf"^{re.escape(prefix)}(\d+){re.escape(extension)}$")
+
+        frames: List[tuple[int, Path]] = []
+        for candidate in directory.iterdir():
+            if not candidate.is_file():
+                continue
+            candidate_match = regex.match(candidate.name)
+            if not candidate_match:
+                continue
+            try:
+                frame_number = int(candidate_match.group(1))
+            except ValueError:
+                continue
+            frames.append((frame_number, candidate.resolve()))
+
+        if len(frames) < 2:
+            return None
+
+        frames.sort(key=lambda item: item[0])
+        start_number, first_frame = frames[0]
+        frame_count = len(frames)
+        pattern = str(directory / f"{prefix}%0{padding}d{extension}")
+        prefix_name = (
+            prefix.rstrip("_- ")
+            or prefix
+            or first_frame.parent.name
+            or first_frame.stem
+        )
+
+        return SequenceInfo(
+            pattern=pattern,
+            first_frame=first_frame,
+            extension=extension,
+            start_number=start_number,
+            frame_count=frame_count,
+            prefix=prefix_name,
+            padding=padding,
+        )
+
+    def _build_sequence_task(self, sequence: SequenceInfo) -> ConversionTask | None:
+        output_stem = (
+            sequence.prefix.strip()
+            or sequence.first_frame.parent.name
+            or sequence.first_frame.stem
+        )
+        output_stem = output_stem.replace(" ", "_")
+        display_name = (
+            f"{output_stem}{sequence.extension} 序列 ({sequence.frame_count} 张)"
+        )
+
+        return ConversionTask(
+            display_name=display_name,
+            source=sequence.first_frame,
+            output_stem=output_stem,
+            is_sequence=True,
+            sequence_pattern=sequence.pattern,
+            frame_extension=sequence.extension,
+            frame_count=sequence.frame_count,
+            first_frame=sequence.first_frame,
+            start_number=sequence.start_number,
+            duration_ms=sequence.frame_count * 150,
+        )
+
+    def _current_fps(self) -> float:
+        text = self._fps_edit.text().strip()
+        try:
+            return float(text) if text else 10.0
+        except ValueError:
+            return 10.0
 
     def _apply_defaults_if_needed(self) -> None:
-        if self._defaults_applied or self._files_list.count() == 0:
+        if self._defaults_applied or not self._tasks:
             return
 
-        first_path = Path(self._files_list.item(0).text())
+        first_task = self._tasks[0]
         try:
-            width, height, fps = probe_video_metadata(first_path)
+            if first_task.is_sequence and first_task.first_frame:
+                width, height = probe_image_metadata(first_task.first_frame)
+                fps = self._current_fps()
+            elif first_task.source.suffix.lower() in IMAGE_EXTENSIONS:
+                width, height = probe_image_metadata(first_task.source)
+                fps = self._current_fps()
+            else:
+                width, height, fps, frames, duration = probe_video_metadata(
+                    first_task.source
+                )
+                first_task.total_frames = frames
+                first_task.duration_ms = duration
         except ConverterError as exc:
-            self._append_log(f"⚠️ 无法读取 {first_path.name} 的参数：{exc}")
+            self._append_log(f"⚠️ 无法读取 {first_task.display_name} 的参数：{exc}")
             return
 
         self._width_edit.setText(str(width))
@@ -341,12 +590,12 @@ class MainWindow(QWidget):
             else:
                 paths.append(local_path)
 
-        video_paths = [p for p in paths if p.suffix.lower() in VIDEO_EXTENSIONS]
-        if video_paths:
-            self._add_paths(video_paths)
+        filtered = [p for p in paths if p.suffix.lower() in SUPPORTED_EXTENSIONS]
+        if filtered:
+            self._add_paths(filtered)
             event.acceptProposedAction()
         else:
-            self._append_log("拖拽内容未包含可支持的视频文件")
+            self._append_log("拖拽内容未包含可支持的媒体文件")
             event.ignore()
 
     def _contains_valid_urls(self, mime_data: QMimeData) -> bool:
@@ -356,9 +605,41 @@ class MainWindow(QWidget):
             path = Path(url.toLocalFile())
             if path.is_dir():
                 return True
-            if path.suffix.lower() in VIDEO_EXTENSIONS:
+            if path.suffix.lower() in SUPPORTED_EXTENSIONS:
                 return True
         return False
+
+    def _on_pause(self) -> None:
+        if self._worker:
+            self._worker.pause()
+            self._pause_btn.setEnabled(False)
+            self._resume_btn.setEnabled(True)
+
+    def _on_resume(self) -> None:
+        if self._worker:
+            self._worker.resume()
+            self._pause_btn.setEnabled(True)
+            self._resume_btn.setEnabled(False)
+
+    def _on_cancel(self) -> None:
+        if self._worker:
+            self._was_cancelled = True
+            self._worker.cancel("用户终止了转换")
+            self._pause_btn.setEnabled(False)
+            self._resume_btn.setEnabled(False)
+            self._cancel_btn.setEnabled(False)
+
+    def _set_controls_stopped(self) -> None:
+        self._start_btn.setEnabled(bool(self._tasks) and bool(self._output_edit.text()))
+        self._pause_btn.setEnabled(False)
+        self._resume_btn.setEnabled(False)
+        self._cancel_btn.setEnabled(False)
+
+    def _on_worker_paused(self, paused: bool) -> None:
+        self._pause_btn.setEnabled(not paused)
+        self._resume_btn.setEnabled(paused)
+        status = "已暂停" if paused else "继续转换"
+        self._append_log(status)
 
 
 def main() -> int:

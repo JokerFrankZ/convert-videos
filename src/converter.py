@@ -2,31 +2,106 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import Callable, Iterable, Tuple
+from typing import Callable, Iterable, Optional, Tuple
+from collections import deque
 
 
 class ConverterError(Exception):
     """Raised when a conversion cannot be completed."""
 
 
+class ConversionCancelled(Exception):
+    """Raised when a conversion is cancelled by the user."""
+
+
 LogCallback = Callable[[str], None]
-ProgressCallback = Callable[[str], None]
+
+
+@dataclass(slots=True)
+class ConversionProgress:
+    task_index: int
+    total_tasks: int
+    task_name: str
+    stage: str
+    task_progress: float
+    overall_progress: float
+
+
+ProgressCallback = Callable[[ConversionProgress], None]
+
+
+@dataclass(slots=True)
+class ConversionTask:
+    display_name: str
+    source: Path
+    output_stem: str
+    is_sequence: bool = False
+    sequence_pattern: Optional[str] = None
+    frame_extension: Optional[str] = None
+    frame_count: Optional[int] = None
+    first_frame: Optional[Path] = None
+    start_number: Optional[int] = None
+    total_frames: Optional[int] = None
+    duration_ms: Optional[int] = None
+
+
+@dataclass(slots=True)
+class ControlSignals:
+    pause_event: threading.Event = field(default_factory=threading.Event)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    _process: Optional[subprocess.Popen] = None
+    cancel_reason: str | None = None
+
+    def attach(self, process: Optional[subprocess.Popen]) -> None:
+        self._process = process
+        if process is None:
+            self.pause_event.set()
+
+    def request_pause(self) -> None:
+        self.pause_event.clear()
+        if self._process and sys.platform != "win32":
+            try:
+                self._process.send_signal(signal.SIGSTOP)
+            except Exception:
+                pass
+
+    def request_resume(self) -> None:
+        self.pause_event.set()
+        if self._process and sys.platform != "win32":
+            try:
+                self._process.send_signal(signal.SIGCONT)
+            except Exception:
+                pass
+
+    def request_cancel(self, reason: str | None = None) -> None:
+        self.cancel_reason = reason or "转换已被终止"
+        self.cancel_event.set()
+        self.pause_event.set()
+        if self._process:
+            try:
+                self._process.terminate()
+            except Exception:
+                pass
 
 
 @dataclass(slots=True)
 class ConversionRequest:
-    input_files: Iterable[Path]
+    tasks: Iterable[ConversionTask]
     output_dir: Path
     width: int = 259
     height: int = 194
     fps: float = 10.0
     quality: str = "high"
+    signals: ControlSignals | None = None
 
 
 def _resource_root() -> Path:
@@ -79,8 +154,10 @@ def get_ffprobe_executable() -> Path:
     return _get_binary_path("ffprobe")
 
 
-def probe_video_metadata(video_path: Path) -> Tuple[int, int, float]:
-    """Return width, height and fps for a given video file."""
+def probe_video_metadata(
+    video_path: Path,
+) -> Tuple[int, int, float, Optional[int], Optional[int]]:
+    """Return width, height, fps, total frames, duration ms."""
 
     ffprobe_path = get_ffprobe_executable()
 
@@ -91,7 +168,7 @@ def probe_video_metadata(video_path: Path) -> Tuple[int, int, float]:
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height,r_frame_rate",
+        "stream=width,height,r_frame_rate,nb_frames,duration_ts,time_base",
         "-of",
         "json",
         str(video_path),
@@ -118,6 +195,18 @@ def probe_video_metadata(video_path: Path) -> Tuple[int, int, float]:
         if fraction.denominator == 0:
             raise ZeroDivisionError
         fps = float(fraction)
+        nb_frames = stream.get("nb_frames")
+        if nb_frames and nb_frames.isdigit():
+            total_frames = int(nb_frames)
+        else:
+            total_frames = None
+        duration_ts = stream.get("duration_ts")
+        time_base = stream.get("time_base")
+        duration_ms = None
+        if duration_ts and time_base:
+            num, denom = time_base.split("/")
+            duration_seconds = int(duration_ts) * (int(num) / int(denom))
+            duration_ms = int(duration_seconds * 1000)
     except (
         KeyError,
         IndexError,
@@ -127,13 +216,59 @@ def probe_video_metadata(video_path: Path) -> Tuple[int, int, float]:
     ) as exc:
         raise ConverterError("解析视频信息失败") from exc
 
+    if total_frames is None:
+        count_command = [
+            str(ffprobe_path),
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "default=nokey=1:noprint_wrappers=1",
+            str(video_path),
+        ]
+        count_process = subprocess.run(
+            count_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if count_process.returncode == 0:
+            try:
+                total_frames = int(count_process.stdout.strip())
+            except ValueError:
+                total_frames = None
+
+    if total_frames is None and duration_ms is not None:
+        total_frames = max(1, int(fps * duration_ms / 1000))
+
     if width <= 0 or height <= 0 or fps <= 0:
         raise ConverterError("获取到的视频参数无效")
 
-    return width, height, fps
+    return width, height, fps, total_frames, duration_ms
 
 
-def _gif_filter(width: int, height: int, fps: int) -> str:
+def probe_image_metadata(
+    image_path: Path,
+) -> Tuple[int, int, Optional[int], Optional[int]]:
+    from PIL import Image
+
+    try:
+        with Image.open(image_path) as img:
+            width, height = img.size
+    except Exception as exc:  # noqa: BLE001
+        raise ConverterError(f"解析图片信息失败：{image_path.name}") from exc
+
+    if width <= 0 or height <= 0:
+        raise ConverterError("获取到的图片尺寸无效")
+
+    return width, height, None, 150
+
+
+def _gif_filter(width: int, height: int, fps: float) -> str:
     return (
         f"scale={width}:{height}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height},fps={fps}"
@@ -176,6 +311,176 @@ def _run_command(command: list[str]) -> Tuple[int, str]:
     return process.returncode, process.stderr.strip()
 
 
+def _run_ffmpeg_with_progress(
+    command: list[str],
+    *,
+    emit: Callable[[float, str], None] | None,
+    stage_label: str,
+    base: float,
+    extent: float,
+    frame_estimate: Optional[int],
+    duration_ms: Optional[int],
+    signals: ControlSignals | None = None,
+) -> tuple[int, str]:
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    if signals:
+        signals.attach(process)
+
+    stage_ratio = 0.0  # 0~1
+    last_emit_ratio = -1.0
+    last_real_ratio = 0.0
+    last_emit_time = time.monotonic()
+    last_real_time = last_emit_time
+    stage_start = last_emit_time
+    cancelled = False
+
+    def _emit(ratio: float, description: str, force: bool = False) -> None:
+        nonlocal last_emit_ratio, last_emit_time
+        if emit is None:
+            return
+        ratio = max(0.0, min(1.0, ratio))
+        now = time.monotonic()
+        if (
+            force
+            or ratio - last_emit_ratio >= 0.001
+            or now - last_emit_time >= 0.2
+            or ratio >= 1.0
+        ):
+            global_ratio = base + ratio * extent
+            emit(global_ratio, description)
+            last_emit_ratio = ratio
+            last_emit_time = now
+
+    def _synthetic_step() -> None:
+        nonlocal stage_ratio
+        now = time.monotonic()
+        elapsed = now - stage_start
+        target = stage_ratio
+        if duration_ms and duration_ms > 0:
+            target = max(target, min(1.0, elapsed / (duration_ms / 1000)))
+        elif frame_estimate and frame_estimate > 0:
+            # 估算平均帧耗时
+            target = max(
+                target,
+                min(
+                    1.0, elapsed / max(0.5, frame_estimate / max(10.0, frame_estimate))
+                ),
+            )
+        else:
+            target = min(1.0, stage_ratio + 0.01)
+
+        if target > stage_ratio:
+            stage_ratio = target
+            _emit(
+                stage_ratio, f"{stage_label} 估算 {stage_ratio * 100:.1f}%", force=True
+            )
+
+    try:
+        if emit:
+            emit(base, f"{stage_label} 0.0% (全局 {base * 100:.1f}%)")
+
+        if process.stdout:
+            for raw_line in process.stdout:
+                if signals and signals.cancel_event.is_set():
+                    cancelled = True
+                    process.terminate()
+                    break
+                while (
+                    signals
+                    and not signals.pause_event.is_set()
+                    and not signals.cancel_event.is_set()
+                ):
+                    time.sleep(0.05)
+                if signals and signals.cancel_event.is_set():
+                    cancelled = True
+                    process.terminate()
+                    break
+
+                now = time.monotonic()
+                if now - last_real_time >= 0.3:
+                    _synthetic_step()
+
+                line = raw_line.strip()
+                if "=" not in line:
+                    continue
+                key, _, value_text = line.partition("=")
+
+                ratio_update: Optional[float] = None
+                if frame_estimate and frame_estimate > 0 and key == "frame":
+                    try:
+                        current = int(value_text.strip())
+                    except ValueError:
+                        current = None
+                    if current is not None:
+                        ratio_update = current / frame_estimate
+                elif (
+                    duration_ms
+                    and duration_ms > 0
+                    and key in {"out_time_ms", "out_time_us"}
+                ):
+                    try:
+                        scale = 1 if key == "out_time_ms" else 1000
+                        current_ms = int(value_text.strip()) / scale
+                    except ValueError:
+                        current_ms = None
+                    if current_ms is not None:
+                        ratio_update = current_ms / duration_ms
+                elif duration_ms and duration_ms > 0 and key == "out_time":
+                    try:
+                        h, m, s = value_text.strip().split(":")
+                        seconds = int(h) * 3600 + int(m) * 60 + float(s)
+                        ratio_update = (seconds * 1000) / duration_ms
+                    except ValueError:
+                        ratio_update = None
+                elif key == "progress" and value_text.strip() == "end":
+                    ratio_update = 1.0
+
+                if ratio_update is not None:
+                    ratio_update = max(ratio_update, last_real_ratio)
+                    ratio_update = min(1.0, ratio_update)
+                    stage_ratio = ratio_update
+                    last_real_ratio = ratio_update
+                    last_real_time = time.monotonic()
+                    _emit(
+                        stage_ratio,
+                        f"{stage_label} {stage_ratio * 100:.1f}% (全局 {(base + stage_ratio * extent) * 100:.1f}%)",
+                    )
+    finally:
+        if process.stdout:
+            process.stdout.close()
+
+    if process.stderr:
+        stderr_output = process.stderr.read()
+        process.stderr.close()
+    else:
+        stderr_output = ""
+
+    if signals:
+        signals.attach(None)
+
+    if cancelled:
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        raise ConversionCancelled
+
+    returncode = process.wait()
+    if emit:
+        _emit(
+            1.0, f"{stage_label} 100.0% (全局 {(base + extent) * 100:.1f}%)", force=True
+        )
+    return returncode, stderr_output
+
+
 def convert_files(
     request: ConversionRequest,
     progress: ProgressCallback | None = None,
@@ -186,20 +491,73 @@ def convert_files(
     output_dir = request.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    files = list(request.input_files)
-    if not files:
-        raise ConverterError("未选择任何视频文件")
+    tasks = list(request.tasks)
+    if not tasks:
+        raise ConverterError("未选择任何待转换任务")
 
     base_filter = _gif_filter(request.width, request.height, request.fps)
     palette_filter = _gif_quality_filter(base_filter, request.quality)
 
-    for index, input_path in enumerate(files, start=1):
-        if progress:
-            progress(f"开始处理 ({index}/{len(files)}): {input_path.name}")
+    signals = request.signals
+    if signals:
+        signals.pause_event.set()
+    total_tasks = len(tasks)
 
-        stem = input_path.stem
-        gif_output = output_dir / f"{stem}.gif"
-        png_output = output_dir / f"{stem}.png"
+    for index, task in enumerate(tasks, start=1):
+        if signals and signals.cancel_event.is_set():
+            raise ConversionCancelled
+
+        gif_output = output_dir / f"{task.output_stem}.gif"
+        png_output = output_dir / f"{task.output_stem}.png"
+
+        def emit_abs(progress_value: float, stage: str) -> None:
+            clamped = max(0.0, min(1.0, progress_value))
+            if signals:
+                while (
+                    not signals.pause_event.is_set()
+                    and not signals.cancel_event.is_set()
+                ):
+                    time.sleep(0.05)
+                if signals.cancel_event.is_set():
+                    raise ConversionCancelled
+            if progress:
+                progress(
+                    ConversionProgress(
+                        task_index=index,
+                        total_tasks=total_tasks,
+                        task_name=task.display_name,
+                        stage=stage,
+                        task_progress=clamped,
+                        overall_progress=min(
+                            1.0, ((index - 1) + clamped) / total_tasks
+                        ),
+                    )
+                )
+
+        emit_abs(0.0, "准备")
+
+        input_args: list[str] = []
+        if task.is_sequence and task.sequence_pattern:
+            input_args.extend(
+                [
+                    "-start_number",
+                    str(task.start_number or 0),
+                    "-i",
+                    task.sequence_pattern,
+                ]
+            )
+            total_frames = task.frame_count
+            duration_ms = task.duration_ms
+        else:
+            input_args.extend(["-i", str(task.source)])
+            total_frames = task.total_frames
+            duration_ms = task.duration_ms
+
+        frame_estimate: Optional[int] = None
+        if total_frames and total_frames > 0:
+            frame_estimate = max(1, total_frames)
+        elif duration_ms and duration_ms > 0:
+            frame_estimate = max(1, int(request.fps * (duration_ms / 1000)))
 
         gif_command = [
             str(ffmpeg_path),
@@ -207,12 +565,32 @@ def convert_files(
             "-loglevel",
             "error",
             "-y",
-            "-i",
-            str(input_path),
+            *input_args,
             "-vf",
             palette_filter,
+            "-progress",
+            "pipe:1",
+            "-nostats",
             str(gif_output),
         ]
+
+        if log:
+            log(f"正在生成 GIF：{gif_output.name}")
+        gif_code, gif_stderr = _run_ffmpeg_with_progress(
+            gif_command,
+            emit=emit_abs,
+            stage_label="GIF 转换",
+            base=0.05,
+            extent=0.45,
+            frame_estimate=frame_estimate,
+            duration_ms=duration_ms,
+            signals=signals,
+        )
+        if gif_code != 0:
+            detail = gif_stderr or "未知错误"
+            raise ConverterError(f"转换 GIF 失败（{task.display_name}）：{detail}")
+
+        emit_abs(0.55, "GIF 完成")
 
         apng_command = [
             str(ffmpeg_path),
@@ -220,31 +598,31 @@ def convert_files(
             "-loglevel",
             "error",
             "-y",
-            "-i",
-            str(input_path),
+            *input_args,
             "-vf",
             base_filter,
             "-f",
             "apng",
+            "-progress",
+            "pipe:1",
+            "-nostats",
             str(png_output),
         ]
 
         if log:
-            log(f"正在生成 GIF：{gif_output.name}")
-        gif_code, gif_stderr = _run_command(gif_command)
-        if gif_code != 0:
-            detail = gif_stderr or "未知错误"
-            raise ConverterError(f"转换 GIF 失败（{input_path.name}）：{detail}")
-
-        if log:
             log(f"正在生成 APNG：{png_output.name}")
-        apng_code, apng_stderr = _run_command(apng_command)
+        apng_code, apng_stderr = _run_ffmpeg_with_progress(
+            apng_command,
+            emit=emit_abs,
+            stage_label="APNG 转换",
+            base=0.60,
+            extent=0.35,
+            frame_estimate=frame_estimate,
+            duration_ms=duration_ms,
+            signals=signals,
+        )
         if apng_code != 0:
             detail = apng_stderr or "未知错误"
-            raise ConverterError(f"转换 APNG 失败（{input_path.name}）：{detail}")
+            raise ConverterError(f"转换 APNG 失败（{task.display_name}）：{detail}")
 
-        if progress:
-            progress(f"完成: {input_path.name}")
-
-    if progress:
-        progress(f"全部完成，共转换 {len(files)} 个视频")
+        emit_abs(1.0, "完成")

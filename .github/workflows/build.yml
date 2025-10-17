@@ -46,7 +46,7 @@ jobs:
           zip -r video-converter-macos.zip video-converter.app
 
       - name: Upload macOS artifact
-        if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v') == false
+        if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
           name: video-converter-macos
@@ -98,7 +98,7 @@ jobs:
           Compress-Archive -Path "dist\video-converter\*" -DestinationPath "dist\video-converter-windows.zip"
 
       - name: Upload Windows artifact
-        if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v') == false
+        if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
           name: video-converter-windows
