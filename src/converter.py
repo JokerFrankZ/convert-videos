@@ -8,11 +8,13 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Tuple
-from collections import deque
+
+from progress_tracker import StageProgressTracker, TaskProgressEmitter
 
 
 class ConverterError(Exception):
@@ -333,58 +335,16 @@ def _run_ffmpeg_with_progress(
     if signals:
         signals.attach(process)
 
-    stage_ratio = 0.0  # 0~1
-    last_emit_ratio = -1.0
-    last_real_ratio = 0.0
-    last_emit_time = time.monotonic()
-    last_real_time = last_emit_time
-    stage_start = last_emit_time
+    tracker = StageProgressTracker(
+        stage_label=stage_label,
+        base=base,
+        extent=extent,
+        emit=emit,
+    )
     cancelled = False
 
-    def _emit(ratio: float, description: str, force: bool = False) -> None:
-        nonlocal last_emit_ratio, last_emit_time
-        if emit is None:
-            return
-        ratio = max(0.0, min(1.0, ratio))
-        now = time.monotonic()
-        if (
-            force
-            or ratio - last_emit_ratio >= 0.001
-            or now - last_emit_time >= 0.2
-            or ratio >= 1.0
-        ):
-            global_ratio = base + ratio * extent
-            emit(global_ratio, description)
-            last_emit_ratio = ratio
-            last_emit_time = now
-
-    def _synthetic_step() -> None:
-        nonlocal stage_ratio
-        now = time.monotonic()
-        elapsed = now - stage_start
-        target = stage_ratio
-        if duration_ms and duration_ms > 0:
-            target = max(target, min(1.0, elapsed / (duration_ms / 1000)))
-        elif frame_estimate and frame_estimate > 0:
-            # 估算平均帧耗时
-            target = max(
-                target,
-                min(
-                    1.0, elapsed / max(0.5, frame_estimate / max(10.0, frame_estimate))
-                ),
-            )
-        else:
-            target = min(1.0, stage_ratio + 0.01)
-
-        if target > stage_ratio:
-            stage_ratio = target
-            _emit(
-                stage_ratio, f"{stage_label} 估算 {stage_ratio * 100:.1f}%", force=True
-            )
-
     try:
-        if emit:
-            emit(base, f"{stage_label} 0.0% (全局 {base * 100:.1f}%)")
+        tracker.emit_initial()
 
         if process.stdout:
             for raw_line in process.stdout:
@@ -404,54 +364,23 @@ def _run_ffmpeg_with_progress(
                     break
 
                 now = time.monotonic()
-                if now - last_real_time >= 0.3:
-                    _synthetic_step()
+                if tracker.needs_synthetic_update(now):
+                    tracker.synthetic_step(
+                        duration_ms=duration_ms,
+                        frame_estimate=frame_estimate,
+                    )
 
                 line = raw_line.strip()
                 if "=" not in line:
                     continue
                 key, _, value_text = line.partition("=")
 
-                ratio_update: Optional[float] = None
-                if frame_estimate and frame_estimate > 0 and key == "frame":
-                    try:
-                        current = int(value_text.strip())
-                    except ValueError:
-                        current = None
-                    if current is not None:
-                        ratio_update = current / frame_estimate
-                elif (
-                    duration_ms
-                    and duration_ms > 0
-                    and key in {"out_time_ms", "out_time_us"}
-                ):
-                    try:
-                        scale = 1 if key == "out_time_ms" else 1000
-                        current_ms = int(value_text.strip()) / scale
-                    except ValueError:
-                        current_ms = None
-                    if current_ms is not None:
-                        ratio_update = current_ms / duration_ms
-                elif duration_ms and duration_ms > 0 and key == "out_time":
-                    try:
-                        h, m, s = value_text.strip().split(":")
-                        seconds = int(h) * 3600 + int(m) * 60 + float(s)
-                        ratio_update = (seconds * 1000) / duration_ms
-                    except ValueError:
-                        ratio_update = None
-                elif key == "progress" and value_text.strip() == "end":
-                    ratio_update = 1.0
-
-                if ratio_update is not None:
-                    ratio_update = max(ratio_update, last_real_ratio)
-                    ratio_update = min(1.0, ratio_update)
-                    stage_ratio = ratio_update
-                    last_real_ratio = ratio_update
-                    last_real_time = time.monotonic()
-                    _emit(
-                        stage_ratio,
-                        f"{stage_label} {stage_ratio * 100:.1f}% (全局 {(base + stage_ratio * extent) * 100:.1f}%)",
-                    )
+                tracker.try_update_from_ffmpeg(
+                    key=key,
+                    value_text=value_text,
+                    frame_estimate=frame_estimate,
+                    duration_ms=duration_ms,
+                )
     finally:
         if process.stdout:
             process.stdout.close()
@@ -474,10 +403,7 @@ def _run_ffmpeg_with_progress(
         raise ConversionCancelled
 
     returncode = process.wait()
-    if emit:
-        _emit(
-            1.0, f"{stage_label} 100.0% (全局 {(base + extent) * 100:.1f}%)", force=True
-        )
+    tracker.finish()
     return returncode, stderr_output
 
 
@@ -510,29 +436,18 @@ def convert_files(
         gif_output = output_dir / f"{task.output_stem}.gif"
         png_output = output_dir / f"{task.output_stem}.png"
 
+        task_emitter = TaskProgressEmitter(
+            task_index=index,
+            total_tasks=total_tasks,
+            task_name=task.display_name,
+            progress_callback=progress,
+            progress_factory=ConversionProgress,
+            signals=signals,
+            cancel_exception=ConversionCancelled,
+        )
+
         def emit_abs(progress_value: float, stage: str) -> None:
-            clamped = max(0.0, min(1.0, progress_value))
-            if signals:
-                while (
-                    not signals.pause_event.is_set()
-                    and not signals.cancel_event.is_set()
-                ):
-                    time.sleep(0.05)
-                if signals.cancel_event.is_set():
-                    raise ConversionCancelled
-            if progress:
-                progress(
-                    ConversionProgress(
-                        task_index=index,
-                        total_tasks=total_tasks,
-                        task_name=task.display_name,
-                        stage=stage,
-                        task_progress=clamped,
-                        overall_progress=min(
-                            1.0, ((index - 1) + clamped) / total_tasks
-                        ),
-                    )
-                )
+            task_emitter.emit(progress_value, stage)
 
         emit_abs(0.0, "准备")
 
