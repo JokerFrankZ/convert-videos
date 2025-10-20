@@ -99,10 +99,10 @@ class ControlSignals:
 class ConversionRequest:
     tasks: Iterable[ConversionTask]
     output_dir: Path
-    width: int = 259
-    height: int = 194
-    fps: float = 10.0
-    quality: str = "high"
+    width: int = 320
+    height: int = 180
+    fps: float = 12.0
+    quality: str = "balanced"
     signals: ControlSignals | None = None
 
 
@@ -284,10 +284,15 @@ def _gif_quality_filter(base_filter: str, quality: str) -> str:
             f"{base_filter},split[s0][s1];[s0]palettegen=max_colors=256[p];"
             "[s1][p]paletteuse"
         ),
+        "balanced": (
+            f"{base_filter},split[s0][s1];[s0]palettegen="
+            "max_colors=192:stats_mode=single[p];[s1][p]paletteuse="
+            "dither=bayer:bayer_scale=3"
+        ),
         "high": (
             f"{base_filter},split[s0][s1];[s0]palettegen="
-            "max_colors=256:stats_mode=single[p];[s1][p]paletteuse="
-            "dither=bayer:bayer_scale=2"
+            "max_colors=256:stats_mode=single:reserve_transparent=0[p];"
+            "[s1][p]paletteuse=dither=bayer:bayer_scale=2"
         ),
         "ultra": (
             f"{base_filter},split[s0][s1];[s0]palettegen="
