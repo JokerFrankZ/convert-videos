@@ -422,6 +422,12 @@ def convert_files(
     output_dir = request.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if output_dir.name.lower() == "output":
+        target_output_dir = output_dir
+    else:
+        target_output_dir = output_dir / "output"
+        target_output_dir.mkdir(parents=True, exist_ok=True)
+
     tasks = list(request.tasks)
     if not tasks:
         raise ConverterError("未选择任何待转换任务")
@@ -438,8 +444,8 @@ def convert_files(
         if signals and signals.cancel_event.is_set():
             raise ConversionCancelled
 
-        gif_output = output_dir / f"{task.output_stem}.gif"
-        png_output = output_dir / f"{task.output_stem}.png"
+        gif_output = target_output_dir / f"{task.output_stem}.gif"
+        png_output = target_output_dir / f"{task.output_stem}.png"
 
         task_emitter = TaskProgressEmitter(
             task_index=index,
