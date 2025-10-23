@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt, QMimeData, QThread, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QGridLayout,
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from converter import (
+    DEFAULT_EXPORT_FORMATS,
     ConversionProgress,
     ConversionRequest,
     ConversionTask,
@@ -131,6 +133,14 @@ class MainWindow(QWidget):
         for label, value in QUALITY_OPTIONS:
             self._quality_combo.addItem(label, userData=value)
         self._quality_combo.setCurrentIndex(1)  # 默认“中等”
+
+        self._export_gif = QCheckBox("GIF")
+        self._export_apng = QCheckBox("APNG")
+        self._export_png_sequence = QCheckBox("PNG 序列")
+
+        self._export_gif.setChecked(True)
+        self._export_apng.setChecked(True)
+
         self._log_view = QTextEdit()
         self._log_view.setReadOnly(True)
         self._overall_progress = QProgressBar()
@@ -190,6 +200,15 @@ class MainWindow(QWidget):
         settings_layout.addWidget(self._fps_edit, 2, 1)
         settings_layout.addWidget(QLabel("质量"), 2, 2)
         settings_layout.addWidget(self._quality_combo, 2, 3)
+
+        export_layout = QHBoxLayout()
+        export_layout.addWidget(QLabel("导出格式"))
+        export_layout.addWidget(self._export_gif)
+        export_layout.addWidget(self._export_apng)
+        export_layout.addWidget(self._export_png_sequence)
+        export_layout.addStretch(1)
+
+        settings_layout.addLayout(export_layout, 3, 0, 1, 4)
         settings_group.setLayout(settings_layout)
 
         log_group = QGroupBox("日志")
@@ -355,7 +374,20 @@ class MainWindow(QWidget):
             height=height,
             fps=fps,
             quality=quality,
+            export_formats=self._gather_export_formats(),
         )
+
+    def _gather_export_formats(self) -> tuple[str, ...]:
+        formats: list[str] = []
+        if self._export_gif.isChecked():
+            formats.append("gif")
+        if self._export_apng.isChecked():
+            formats.append("apng")
+        if self._export_png_sequence.isChecked():
+            formats.append("png_sequence")
+        if not formats:
+            formats.extend(DEFAULT_EXPORT_FORMATS)
+        return tuple(dict.fromkeys(formats))
 
     def _add_paths(self, paths: Iterable[Path]) -> None:
         new_tasks: list[ConversionTask] = []

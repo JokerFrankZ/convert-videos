@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -26,6 +27,38 @@ class ConversionCancelled(Exception):
 
 
 LogCallback = Callable[[str], None]
+
+
+DEFAULT_EXPORT_FORMATS: tuple[str, ...] = ("gif", "apng")
+VALID_EXPORT_FORMATS = {"gif", "apng", "png_sequence"}
+
+
+class InvalidExportFormat(ConverterError):
+    """Raised when an unknown export format is requested."""
+
+
+FORMAT_EXTENSIONS = {
+    "gif": ".gif",
+    "apng": ".png",
+}
+
+FORMAT_SUBDIRS = {
+    "gif": "gif",
+    "apng": "apng",
+    "png_sequence": "png_sequence",
+}
+
+FORMAT_STAGE_LABELS = {
+    "gif": "GIF 转换",
+    "apng": "APNG 转换",
+    "png_sequence": "PNG 序列导出",
+}
+
+FORMAT_LOG_PREFIX = {
+    "gif": "正在生成 GIF",
+    "apng": "正在生成 APNG",
+    "png_sequence": "正在导出 PNG 序列",
+}
 
 
 @dataclass(slots=True)
@@ -104,6 +137,7 @@ class ConversionRequest:
     fps: float = 12.0
     quality: str = "balanced"
     signals: ControlSignals | None = None
+    export_formats: tuple[str, ...] = DEFAULT_EXPORT_FORMATS
 
 
 def _resource_root() -> Path:
@@ -432,6 +466,30 @@ def convert_files(
     if not tasks:
         raise ConverterError("未选择任何待转换任务")
 
+    raw_formats = request.export_formats or DEFAULT_EXPORT_FORMATS
+    export_formats = list(dict.fromkeys(raw_formats))
+    if not export_formats:
+        export_formats = list(DEFAULT_EXPORT_FORMATS)
+
+    invalid_formats = [fmt for fmt in export_formats if fmt not in VALID_EXPORT_FORMATS]
+    if invalid_formats:
+        raise InvalidExportFormat(
+            "不支持的导出格式：" + ", ".join(sorted(set(invalid_formats)))
+        )
+
+    format_dirs: dict[str, Path] = {}
+    for fmt in export_formats:
+        subdir = FORMAT_SUBDIRS.get(fmt, fmt)
+        fmt_dir = target_output_dir / subdir
+        fmt_dir.mkdir(parents=True, exist_ok=True)
+        format_dirs[fmt] = fmt_dir
+
+    def display_path(path: Path) -> str:
+        try:
+            return str(path.relative_to(target_output_dir))
+        except ValueError:
+            return str(path)
+
     base_filter = _gif_filter(request.width, request.height, request.fps)
     palette_filter = _gif_quality_filter(base_filter, request.quality)
 
@@ -440,12 +498,14 @@ def convert_files(
         signals.pause_event.set()
     total_tasks = len(tasks)
 
+    prep_base = 0.05
+    formats_extent = 0.90
+    format_count = len(export_formats)
+    format_extent = formats_extent / format_count if format_count else 0.0
+
     for index, task in enumerate(tasks, start=1):
         if signals and signals.cancel_event.is_set():
             raise ConversionCancelled
-
-        gif_output = target_output_dir / f"{task.output_stem}.gif"
-        png_output = target_output_dir / f"{task.output_stem}.png"
 
         task_emitter = TaskProgressEmitter(
             task_index=index,
@@ -485,70 +545,89 @@ def convert_files(
         elif duration_ms and duration_ms > 0:
             frame_estimate = max(1, int(request.fps * (duration_ms / 1000)))
 
-        gif_command = [
-            str(ffmpeg_path),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            *input_args,
-            "-vf",
-            palette_filter,
-            "-progress",
-            "pipe:1",
-            "-nostats",
-            str(gif_output),
-        ]
+        if format_count == 0:
+            emit_abs(1.0, "完成")
+            continue
 
-        if log:
-            log(f"正在生成 GIF：{gif_output.name}")
-        gif_code, gif_stderr = _run_ffmpeg_with_progress(
-            gif_command,
-            emit=emit_abs,
-            stage_label="GIF 转换",
-            base=0.05,
-            extent=0.45,
-            frame_estimate=frame_estimate,
-            duration_ms=duration_ms,
-            signals=signals,
-        )
-        if gif_code != 0:
-            detail = gif_stderr or "未知错误"
-            raise ConverterError(f"转换 GIF 失败（{task.display_name}）：{detail}")
+        for fmt_index, fmt in enumerate(export_formats):
+            stage_base = prep_base + format_extent * fmt_index
+            stage_label = FORMAT_STAGE_LABELS[fmt]
+            log_prefix = FORMAT_LOG_PREFIX[fmt]
+            fmt_dir = format_dirs[fmt]
 
-        emit_abs(0.55, "GIF 完成")
+            if fmt in {"gif", "apng"}:
+                suffix = FORMAT_EXTENSIONS[fmt]
+                output_path = fmt_dir / f"{task.output_stem}{suffix}"
+                command: list[str] = [
+                    str(ffmpeg_path),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    *input_args,
+                    "-vf",
+                    palette_filter if fmt == "gif" else base_filter,
+                ]
+                if fmt == "apng":
+                    command.extend(["-f", "apng"])
+                command.extend(
+                    [
+                        "-progress",
+                        "pipe:1",
+                        "-nostats",
+                        str(output_path),
+                    ]
+                )
 
-        apng_command = [
-            str(ffmpeg_path),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            *input_args,
-            "-vf",
-            base_filter,
-            "-f",
-            "apng",
-            "-progress",
-            "pipe:1",
-            "-nostats",
-            str(png_output),
-        ]
+                log_target = output_path
+            elif fmt == "png_sequence":
+                sequence_root = fmt_dir / task.output_stem
+                if sequence_root.exists():
+                    shutil.rmtree(sequence_root)
+                sequence_root.mkdir(parents=True, exist_ok=True)
+                pattern_path = sequence_root / f"{task.output_stem}_%04d.png"
 
-        if log:
-            log(f"正在生成 APNG：{png_output.name}")
-        apng_code, apng_stderr = _run_ffmpeg_with_progress(
-            apng_command,
-            emit=emit_abs,
-            stage_label="APNG 转换",
-            base=0.60,
-            extent=0.35,
-            frame_estimate=frame_estimate,
-            duration_ms=duration_ms,
-            signals=signals,
-        )
-        if apng_code != 0:
-            detail = apng_stderr or "未知错误"
-            raise ConverterError(f"转换 APNG 失败（{task.display_name}）：{detail}")
+                command = [
+                    str(ffmpeg_path),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    *input_args,
+                    "-vf",
+                    base_filter,
+                    "-progress",
+                    "pipe:1",
+                    "-nostats",
+                    str(pattern_path),
+                ]
+
+                log_target = sequence_root
+            else:  # pragma: no cover - guarded by validation
+                raise InvalidExportFormat(f"不支持的导出格式：{fmt}")
+
+            if log:
+                log(f"{log_prefix}：{display_path(log_target)}")
+
+            return_code, stderr_output = _run_ffmpeg_with_progress(
+                command,
+                emit=emit_abs,
+                stage_label=stage_label,
+                base=stage_base,
+                extent=format_extent,
+                frame_estimate=frame_estimate,
+                duration_ms=duration_ms,
+                signals=signals,
+            )
+
+            if return_code != 0:
+                detail = stderr_output or "未知错误"
+                if fmt == "gif":
+                    message = f"转换 GIF 失败（{task.display_name}）：{detail}"
+                elif fmt == "apng":
+                    message = f"转换 APNG 失败（{task.display_name}）：{detail}"
+                else:
+                    message = f"导出 PNG 序列失败（{task.display_name}）：{detail}"
+                raise ConverterError(message)
 
         emit_abs(1.0, "完成")
