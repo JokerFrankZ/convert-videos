@@ -311,6 +311,49 @@ def _gif_filter(width: int, height: int, fps: float) -> str:
     )
 
 
+def _calculate_apng_params(
+    width: int, height: int, fps: float, frame_estimate: Optional[int], target_size_mb: float = 2.0
+) -> tuple[float, Optional[int]]:
+    """根据目标大小计算最佳的 APNG 参数（不改变尺寸）
+
+    返回: (调整后的帧率, 限制的最大帧数)
+    """
+    if not frame_estimate or frame_estimate <= 0:
+        return fps, None
+
+    # 粗略估算: 每帧 PNG 大小约为 宽*高*压缩率 bytes
+    # APNG 的压缩率通常在 0.3-0.8 之间,这里用 0.5 作为估算
+    compression_ratio = 0.5
+    bytes_per_pixel = compression_ratio
+    target_size_bytes = target_size_mb * 1024 * 1024
+
+    # 当前配置下的预估大小
+    estimated_size = width * height * bytes_per_pixel * frame_estimate
+
+    if estimated_size <= target_size_bytes:
+        return fps, None
+
+    # 策略 1: 降低帧率 (最多降低到 6 fps,保证基本流畅度)
+    min_fps = 6.0
+    adjusted_fps = fps
+    adjusted_frames = frame_estimate
+
+    while adjusted_fps > min_fps and estimated_size > target_size_bytes:
+        adjusted_fps = max(min_fps, adjusted_fps * 0.8)
+        adjusted_frames = int(frame_estimate * (adjusted_fps / fps))
+        estimated_size = width * height * bytes_per_pixel * adjusted_frames
+
+    if estimated_size <= target_size_bytes:
+        return adjusted_fps, None
+
+    # 策略 2: 限制最大帧数
+    max_frames = int(target_size_bytes / (width * height * bytes_per_pixel))
+    if max_frames < adjusted_frames:
+        adjusted_frames = max(30, max_frames)  # 至少保留 30 帧
+
+    return adjusted_fps, adjusted_frames
+
+
 def _gif_quality_filter(base_filter: str, quality: str) -> str:
     presets = {
         "low": base_filter,
@@ -558,26 +601,65 @@ def convert_files(
             if fmt in {"gif", "apng"}:
                 suffix = FORMAT_EXTENSIONS[fmt]
                 output_path = fmt_dir / f"{task.output_stem}{suffix}"
-                command: list[str] = [
-                    str(ffmpeg_path),
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-y",
-                    *input_args,
-                    "-vf",
-                    palette_filter if fmt == "gif" else base_filter,
-                ]
+
+                # 为 APNG 计算优化后的参数
                 if fmt == "apng":
-                    command.extend(["-f", "apng"])
-                command.extend(
-                    [
+                    apng_fps, max_frames = _calculate_apng_params(
+                        request.width, request.height, request.fps, frame_estimate
+                    )
+                    apng_filter = _gif_filter(request.width, request.height, apng_fps)
+
+                    command: list[str] = [
+                        str(ffmpeg_path),
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        *input_args,
+                    ]
+
+                    # 如果需要限制帧数,添加帧数限制
+                    if max_frames:
+                        command.extend(["-frames:v", str(max_frames)])
+
+                    command.extend([
+                        "-vf",
+                        apng_filter,
+                        "-f", "apng",
+                        "-plays", "0",  # 无限循环
+                        "-compression_level", "9",  # 最高压缩级别
+                        "-pred", "mixed",  # PNG 预测模式,有助于压缩
+                        "-progress",
+                        "pipe:1",
+                        "-nostats",
+                        str(output_path),
+                    ])
+
+                    # 如果参数被调整,在日志中提示
+                    if apng_fps != request.fps or max_frames:
+                        adjustments = []
+                        if apng_fps != request.fps:
+                            adjustments.append(f"帧率: {apng_fps:.1f}")
+                        if max_frames:
+                            adjustments.append(f"最大帧数: {max_frames}")
+                        if log:
+                            log(f"⚠️ 为控制文件大小在 2MB 以内,已自动调整 APNG 参数: {', '.join(adjustments)}")
+                else:
+                    # GIF 导出保持原样
+                    command: list[str] = [
+                        str(ffmpeg_path),
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        *input_args,
+                        "-vf",
+                        palette_filter,
                         "-progress",
                         "pipe:1",
                         "-nostats",
                         str(output_path),
                     ]
-                )
 
                 log_target = output_path
             elif fmt == "png_sequence":
