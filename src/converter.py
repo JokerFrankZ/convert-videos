@@ -32,9 +32,16 @@ LogCallback = Callable[[str], None]
 DEFAULT_EXPORT_FORMATS: tuple[str, ...] = ("gif", "apng")
 VALID_EXPORT_FORMATS = {"gif", "apng", "png_sequence"}
 
+VALID_SCALE_MODES = {"center_crop", "stretch", "force_aspect"}
+DEFAULT_SCALE_MODE = "center_crop"
+
 
 class InvalidExportFormat(ConverterError):
     """Raised when an unknown export format is requested."""
+
+
+class InvalidScaleMode(ConverterError):
+    """Raised when an unknown scale mode is requested."""
 
 
 FORMAT_EXTENSIONS = {
@@ -79,6 +86,7 @@ class ConversionTask:
     display_name: str
     source: Path
     output_stem: str
+    source_format: Optional[str] = None  # 源文件格式: "video", "gif", "apng", "image_sequence"
     is_sequence: bool = False
     sequence_pattern: Optional[str] = None
     frame_extension: Optional[str] = None
@@ -136,6 +144,7 @@ class ConversionRequest:
     height: int = 180
     fps: float = 12.0
     quality: str = "balanced"
+    scale_mode: str = DEFAULT_SCALE_MODE
     signals: ControlSignals | None = None
     export_formats: tuple[str, ...] = DEFAULT_EXPORT_FORMATS
 
@@ -304,11 +313,106 @@ def probe_image_metadata(
     return width, height, None, 150
 
 
-def _gif_filter(width: int, height: int, fps: float) -> str:
-    return (
-        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},fps={fps}"
+def probe_animated_image_metadata(
+    image_path: Path,
+) -> Tuple[int, int, float, Optional[int], Optional[int]]:
+    """Probe GIF/APNG metadata using ffprobe. Returns width, height, fps, total frames, duration ms."""
+
+    ffprobe_path = get_ffprobe_executable()
+
+    command = [
+        str(ffprobe_path),
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height,r_frame_rate,nb_frames,duration",
+        "-of",
+        "json",
+        str(image_path),
+    ]
+
+    process = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
+
+    if process.returncode != 0:
+        message = process.stderr.strip() or f"无法读取 {image_path.suffix} 信息"
+        raise ConverterError(message)
+
+    try:
+        data = json.loads(process.stdout)
+        stream = data["streams"][0]
+        width = int(stream["width"])
+        height = int(stream["height"])
+
+        rate = stream.get("r_frame_rate", "10/1")
+        fraction = Fraction(rate)
+        if fraction.denominator == 0:
+            raise ZeroDivisionError
+        fps = float(fraction)
+
+        nb_frames = stream.get("nb_frames")
+        if nb_frames and str(nb_frames).replace(".", "").isdigit():
+            total_frames = int(float(nb_frames))
+        else:
+            total_frames = None
+
+        duration = stream.get("duration")
+        duration_ms = None
+        if duration:
+            try:
+                duration_ms = int(float(duration) * 1000)
+            except (ValueError, TypeError):
+                pass
+
+    except (
+        KeyError,
+        IndexError,
+        ValueError,
+        ZeroDivisionError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise ConverterError(f"解析 {image_path.suffix} 信息失败") from exc
+
+    if total_frames is None and duration_ms is not None:
+        total_frames = max(1, int(fps * duration_ms / 1000))
+
+    if width <= 0 or height <= 0 or fps <= 0:
+        raise ConverterError("获取到的图片参数无效")
+
+    return width, height, fps, total_frames, duration_ms
+
+
+def _gif_filter(width: int, height: int, fps: float, scale_mode: str = "center_crop") -> str:
+    """Generate FFmpeg filter based on scale mode.
+
+    scale_mode options:
+    - center_crop: 居中裁切适配 (Center and crop to fit)
+    - stretch: 拉伸适配 (Stretch to fit)
+    - force_aspect: 强制保持原始宽高比 (Force original aspect ratio)
+    """
+    if scale_mode == "center_crop":
+        # 放大到至少一边填满目标尺寸，然后居中裁切
+        return (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},fps={fps}"
+        )
+    elif scale_mode == "stretch":
+        # 拉伸到目标尺寸，不保持宽高比
+        return f"scale={width}:{height},fps={fps}"
+    elif scale_mode == "force_aspect":
+        # 保持宽高比，缩放到目标尺寸内，可能产生黑边
+        return (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={fps}"
+        )
+    else:
+        raise InvalidScaleMode(f"不支持的裁切模式：{scale_mode}")
 
 
 def _calculate_apng_params(
@@ -533,7 +637,13 @@ def convert_files(
         except ValueError:
             return str(path)
 
-    base_filter = _gif_filter(request.width, request.height, request.fps)
+    scale_mode = request.scale_mode
+    if scale_mode not in VALID_SCALE_MODES:
+        raise InvalidScaleMode(
+            f"不支持的裁切模式：{scale_mode}，有效选项为：{', '.join(sorted(VALID_SCALE_MODES))}"
+        )
+
+    base_filter = _gif_filter(request.width, request.height, request.fps, scale_mode)
     palette_filter = _gif_quality_filter(base_filter, request.quality)
 
     signals = request.signals

@@ -37,6 +37,7 @@ from converter import (
     ConverterError,
     ControlSignals,
     convert_files,
+    probe_animated_image_metadata,
     probe_image_metadata,
     probe_video_metadata,
 )
@@ -49,9 +50,16 @@ QUALITY_OPTIONS = [
     ("超高", "ultra"),
 ]
 
+SCALE_MODE_OPTIONS = [
+    ("居中裁切适配", "center_crop"),
+    ("拉伸适配", "stretch"),
+    ("强制保持原始宽高比", "force_aspect"),
+]
+
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mpg", ".mpeg"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
-SUPPORTED_EXTENSIONS = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS
+ANIMATED_EXTENSIONS = {".gif"}  # GIF 和 APNG(.png) 动画格式
+SUPPORTED_EXTENSIONS = VIDEO_EXTENSIONS | IMAGE_EXTENSIONS | ANIMATED_EXTENSIONS
 
 
 class SequenceInfo(NamedTuple):
@@ -132,7 +140,12 @@ class MainWindow(QWidget):
         self._quality_combo = QComboBox()
         for label, value in QUALITY_OPTIONS:
             self._quality_combo.addItem(label, userData=value)
-        self._quality_combo.setCurrentIndex(1)  # 默认“中等”
+        self._quality_combo.setCurrentIndex(1)  # 默认"中等"
+
+        self._scale_mode_combo = QComboBox()
+        for label, value in SCALE_MODE_OPTIONS:
+            self._scale_mode_combo.addItem(label, userData=value)
+        self._scale_mode_combo.setCurrentIndex(0)  # 默认"居中裁切适配"
 
         self._export_gif = QCheckBox("GIF")
         self._export_apng = QCheckBox("APNG")
@@ -200,6 +213,8 @@ class MainWindow(QWidget):
         settings_layout.addWidget(self._fps_edit, 2, 1)
         settings_layout.addWidget(QLabel("质量"), 2, 2)
         settings_layout.addWidget(self._quality_combo, 2, 3)
+        settings_layout.addWidget(QLabel("裁切模式"), 3, 0)
+        settings_layout.addWidget(self._scale_mode_combo, 3, 1, 1, 3)
 
         export_layout = QHBoxLayout()
         export_layout.addWidget(QLabel("导出格式"))
@@ -208,7 +223,7 @@ class MainWindow(QWidget):
         export_layout.addWidget(self._export_png_sequence)
         export_layout.addStretch(1)
 
-        settings_layout.addLayout(export_layout, 3, 0, 1, 4)
+        settings_layout.addLayout(export_layout, 4, 0, 1, 4)
         settings_group.setLayout(settings_layout)
 
         log_group = QGroupBox("日志")
@@ -246,9 +261,9 @@ class MainWindow(QWidget):
     def _on_add_files(self) -> None:  # pragma: no cover - UI
         paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "选择 MP4 文件",
+            "选择媒体文件",
             "",
-            "视频文件 (*.mp4 *.mov *.m4v *.mpg *.mpeg)",
+            "媒体文件 (*.mp4 *.mov *.m4v *.mpg *.mpeg *.gif *.png)",
         )
 
         self._add_paths(Path(path) for path in paths)
@@ -366,6 +381,7 @@ class MainWindow(QWidget):
             raise ConverterError("宽度、高度、帧率必须大于 0")
 
         quality = self._quality_combo.currentData()
+        scale_mode = self._scale_mode_combo.currentData()
 
         return ConversionRequest(
             tasks=self._tasks,
@@ -374,6 +390,7 @@ class MainWindow(QWidget):
             height=height,
             fps=fps,
             quality=quality,
+            scale_mode=scale_mode,
             export_formats=self._gather_export_formats(),
         )
 
@@ -386,7 +403,29 @@ class MainWindow(QWidget):
         if self._export_png_sequence.isChecked():
             formats.append("png_sequence")
         if not formats:
-            formats.extend(DEFAULT_EXPORT_FORMATS)
+            # 如果没有勾选任何格式，根据源文件格式推断
+            source_formats = set()
+            for task in self._tasks:
+                if task.source_format:
+                    source_formats.add(task.source_format)
+
+            # 根据源格式映射到导出格式
+            for src_fmt in source_formats:
+                if src_fmt == "gif":
+                    formats.append("gif")
+                elif src_fmt == "apng":
+                    formats.append("apng")
+                elif src_fmt in ("video", "image_sequence"):
+                    # 视频和图片序列默认导出为 GIF 和 APNG
+                    if "gif" not in formats:
+                        formats.append("gif")
+                    if "apng" not in formats:
+                        formats.append("apng")
+
+            # 如果还是没有格式（比如没有任务），使用默认格式
+            if not formats:
+                formats.extend(DEFAULT_EXPORT_FORMATS)
+
         return tuple(dict.fromkeys(formats))
 
     def _add_paths(self, paths: Iterable[Path]) -> None:
@@ -413,6 +452,30 @@ class MainWindow(QWidget):
                     display_name=normalized.name,
                     source=normalized,
                     output_stem=normalized.stem,
+                    source_format="video",
+                    total_frames=frames,
+                    duration_ms=duration,
+                )
+                self._file_set.add(key)
+                new_tasks.append(task)
+                continue
+
+            # 处理 GIF 动画
+            if suffix in ANIMATED_EXTENSIONS:
+                if key in self._file_set:
+                    continue
+                try:
+                    width, height, fps, frames, duration = probe_animated_image_metadata(
+                        normalized
+                    )
+                except ConverterError as exc:
+                    self._append_log(f"⚠️ 无法读取 {normalized.name} 的参数：{exc}")
+                    continue
+                task = ConversionTask(
+                    display_name=normalized.name,
+                    source=normalized,
+                    output_stem=normalized.stem,
+                    source_format="gif",
                     total_frames=frames,
                     duration_ms=duration,
                 )
@@ -421,6 +484,31 @@ class MainWindow(QWidget):
                 continue
 
             if suffix in IMAGE_EXTENSIONS:
+                # 尝试检测是否为 APNG（动画 PNG）
+                if suffix == ".png":
+                    try:
+                        width, height, fps, frames, duration = probe_animated_image_metadata(
+                            normalized
+                        )
+                        # 如果成功获取帧数且大于1，说明是 APNG
+                        if frames and frames > 1:
+                            if key in self._file_set:
+                                continue
+                            task = ConversionTask(
+                                display_name=normalized.name,
+                                source=normalized,
+                                output_stem=normalized.stem,
+                                source_format="apng",
+                                total_frames=frames,
+                                duration_ms=duration,
+                            )
+                            self._file_set.add(key)
+                            new_tasks.append(task)
+                            continue
+                    except ConverterError:
+                        # 如果探测失败，按照普通图片处理
+                        pass
+
                 sequence = self._detect_sequence(normalized)
                 if sequence:
                     sequence_key = sequence.pattern
@@ -428,6 +516,7 @@ class MainWindow(QWidget):
                         continue
                     task = self._build_sequence_task(sequence)
                     if task:
+                        task.source_format = "image_sequence"
                         task.frame_count = sequence.frame_count
                         task.duration_ms = sequence.frame_count * 150
                         self._file_set.add(sequence_key)
@@ -440,6 +529,7 @@ class MainWindow(QWidget):
                     display_name=normalized.name,
                     source=normalized,
                     output_stem=normalized.stem,
+                    source_format="image_sequence",
                     is_sequence=True,
                     sequence_pattern=str(normalized),
                     frame_extension=suffix,
