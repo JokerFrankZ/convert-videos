@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import threading
+import io
 import re
 import sys
 import time
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Iterable, List, NamedTuple, Optional
 
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -41,6 +43,7 @@ from converter import (
     probe_image_metadata,
     probe_video_metadata,
 )
+from process_excel import process_excel as execute_excel_template
 
 
 QUALITY_OPTIONS = [
@@ -125,12 +128,118 @@ class ConversionWorker(QThread):
         self.progress_signal.emit(progress)
 
 
+class ConversionCancelled(Exception):
+    """用户取消转换时抛出的异常。"""
+
+
+class _ExcelLogStream(io.TextIOBase):
+    def __init__(self, emit_line):
+        super().__init__()
+        self._emit_line = emit_line
+        self._buffer = ""
+
+    def write(self, text):  # type: ignore[override]
+        if not text:
+            return 0
+        self._buffer += text.replace("\r\n", "\n").replace("\r", "\n")
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if line:
+                self._emit_line(line)
+        return len(text)
+
+    def flush(self):  # type: ignore[override]
+        if self._buffer:
+            self._emit_line(self._buffer)
+            self._buffer = ""
+
+
+class ExcelWorker(QThread):
+    log_signal = Signal(str)
+    success_signal = Signal(str)
+    error_signal = Signal(str)
+    finished_signal = Signal()
+
+    def __init__(self, input_path: str, output_path: Optional[str]):
+        super().__init__()
+        self._input_path = input_path
+        self._output_path = output_path
+
+    def run(self) -> None:  # pragma: no cover - UI thread
+        stream = _ExcelLogStream(self.log_signal.emit)
+        try:
+            with redirect_stdout(stream):
+                execute_excel_template(self._input_path, self._output_path or None)
+            stream.flush()
+            self.success_signal.emit("✅ Excel 模板填充完成")
+        except SystemExit as exc:
+            stream.flush()
+            code = exc.code
+            if code not in (None, 0):
+                message = str(code) if isinstance(code, str) else "处理失败，请检查输入"
+                self.error_signal.emit(message)
+            else:
+                self.success_signal.emit("✅ Excel 模板填充完成")
+        except Exception as exc:  # noqa: BLE001
+            stream.flush()
+            self.error_signal.emit(str(exc))
+        finally:
+            self.finished_signal.emit()
+
+
+class FileDropLineEdit(QLineEdit):
+    def __init__(self, filters: Optional[Iterable[str]] = None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self._filters = tuple(f.lower() for f in filters) if filters else ()
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
+        if self._has_valid_urls(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
+        if self._has_valid_urls(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        for url in event.mimeData().urls():
+            path = Path(url.toLocalFile())
+            if not path:
+                continue
+            if self._filters and path.suffix.lower() not in self._filters:
+                continue
+            self.setText(str(path))
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def _has_valid_urls(self, mime_data: QMimeData) -> bool:
+        if not mime_data.hasUrls():
+            return False
+        for url in mime_data.urls():
+            path = Path(url.toLocalFile())
+            if not path:
+                continue
+            if not self._filters or path.suffix.lower() in self._filters:
+                return True
+        return False
+
+
 class MainWindow(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("视频转换器")
         self.resize(800, 600)
         self.setAcceptDrops(True)
+
+        self._tab_widget = QTabWidget()
 
         self._files_list = QListWidget()
         self._output_edit = QLineEdit()
@@ -183,11 +292,31 @@ class MainWindow(QWidget):
         self._start_time: float | None = None
         self._was_cancelled: bool = False
 
-        self._setup_ui()
+        excel_filters = (".xlsx", ".xlsm", ".xltx", ".xltm")
+        self._excel_input_edit = FileDropLineEdit(excel_filters)
+        self._excel_output_edit = FileDropLineEdit(excel_filters)
+        self._excel_input_btn = QPushButton("选择输入文件")
+        self._excel_output_btn = QPushButton("选择输出文件")
+        self._excel_run_btn = QPushButton("开始处理")
+        self._excel_log_view = QTextEdit()
+        self._excel_log_view.setReadOnly(True)
+        self._excel_run_btn.setEnabled(False)
+        self._excel_output_edit.setPlaceholderText("留空则覆盖输入文件")
+
+        self._excel_worker: ExcelWorker | None = None
+
+        self._setup_tabs()
         self._bind_events()
 
-    def _setup_ui(self) -> None:
+    def _setup_tabs(self) -> None:
         main_layout = QVBoxLayout(self)
+        main_layout.addWidget(self._tab_widget)
+        self._tab_widget.addTab(self._create_video_tab(), "视频转换")
+        self._tab_widget.addTab(self._create_excel_tab(), "模板填充")
+
+    def _create_video_tab(self) -> QWidget:
+        tab = QWidget()
+        main_layout = QVBoxLayout(tab)
 
         files_group = QGroupBox("视频文件")
         files_layout = QVBoxLayout()
@@ -248,6 +377,38 @@ class MainWindow(QWidget):
         main_layout.addWidget(log_group)
         main_layout.addLayout(control_layout)
 
+        return tab
+
+    def _create_excel_tab(self) -> QWidget:
+        tab = QWidget()
+        main_layout = QVBoxLayout(tab)
+
+        form_group = QGroupBox("Excel 文件")
+        form_layout = QGridLayout()
+        form_layout.addWidget(QLabel("输入文件"), 0, 0)
+        form_layout.addWidget(self._excel_input_edit, 0, 1)
+        form_layout.addWidget(self._excel_input_btn, 0, 2)
+        form_layout.addWidget(QLabel("输出文件"), 1, 0)
+        form_layout.addWidget(self._excel_output_edit, 1, 1)
+        form_layout.addWidget(self._excel_output_btn, 1, 2)
+        form_group.setLayout(form_layout)
+
+        log_group = QGroupBox("日志")
+        log_layout = QVBoxLayout()
+        log_layout.addWidget(self._excel_log_view)
+        log_group.setLayout(log_layout)
+
+        control_layout = QHBoxLayout()
+        control_layout.addStretch()
+        control_layout.addWidget(self._excel_run_btn)
+
+        main_layout.addWidget(form_group)
+        main_layout.addWidget(log_group)
+        main_layout.addLayout(control_layout)
+        main_layout.addStretch(1)
+
+        return tab
+
     def _bind_events(self) -> None:
         self._add_files_btn.clicked.connect(self._on_add_files)  # type: ignore[arg-type]
         self._add_folder_btn.clicked.connect(self._on_add_folder)  # type: ignore[arg-type]
@@ -257,6 +418,11 @@ class MainWindow(QWidget):
         self._pause_btn.clicked.connect(self._on_pause)  # type: ignore[arg-type]
         self._resume_btn.clicked.connect(self._on_resume)  # type: ignore[arg-type]
         self._cancel_btn.clicked.connect(self._on_cancel)  # type: ignore[arg-type]
+        self._excel_input_btn.clicked.connect(self._on_excel_browse_input)  # type: ignore[arg-type]
+        self._excel_output_btn.clicked.connect(self._on_excel_browse_output)  # type: ignore[arg-type]
+        self._excel_run_btn.clicked.connect(self._on_excel_run)  # type: ignore[arg-type]
+        self._excel_input_edit.textChanged.connect(self._update_excel_run_state)  # type: ignore[arg-type]
+        self._excel_output_edit.textChanged.connect(self._update_excel_run_state)  # type: ignore[arg-type]
 
     def _on_add_files(self) -> None:  # pragma: no cover - UI
         paths, _ = QFileDialog.getOpenFileNames(
@@ -561,6 +727,79 @@ class MainWindow(QWidget):
         self._update_start_state()
         self._apply_defaults_if_needed()
         self._append_log(f"已添加 {len(new_tasks)} 个任务")
+
+    def _on_excel_browse_input(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 Excel 文件",
+            "",
+            "Excel 文件 (*.xlsx *.xlsm *.xltx *.xltm);;所有文件 (*)",
+        )
+        if path:
+            self._excel_input_edit.setText(path)
+
+    def _on_excel_browse_output(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "选择输出 Excel 文件",
+            "",
+            "Excel 文件 (*.xlsx);;所有文件 (*)",
+        )
+        if path:
+            self._excel_output_edit.setText(path)
+
+    def _on_excel_run(self) -> None:
+        if self._excel_worker is not None:
+            return
+
+        input_path = self._excel_input_edit.text().strip()
+        output_path = self._excel_output_edit.text().strip() or None
+
+        if not input_path:
+            QMessageBox.warning(self, "参数错误", "请选择需要处理的 Excel 文件")
+            return
+
+        self._excel_log_view.clear()
+        self._set_excel_controls_running(True)
+
+        self._excel_worker = ExcelWorker(input_path, output_path)
+        self._excel_worker.log_signal.connect(self._append_excel_log)
+        self._excel_worker.error_signal.connect(self._on_excel_error)
+        self._excel_worker.success_signal.connect(self._on_excel_success)
+        self._excel_worker.finished_signal.connect(self._on_excel_finished)
+        self._excel_worker.start()
+
+    def _append_excel_log(self, message: str) -> None:
+        self._excel_log_view.append(message)
+        self._excel_log_view.moveCursor(QTextCursor.End)
+
+    def _on_excel_error(self, message: str) -> None:
+        self._append_excel_log(f"❌ {message}")
+        QMessageBox.critical(self, "处理失败", message)
+
+    def _on_excel_success(self, message: str) -> None:
+        self._append_excel_log(message)
+        QMessageBox.information(self, "处理完成", "Excel 模板填充完成")
+
+    def _on_excel_finished(self) -> None:
+        self._excel_worker = None
+        self._set_excel_controls_running(False)
+
+    def _set_excel_controls_running(self, running: bool) -> None:
+        self._excel_run_btn.setEnabled(not running and bool(self._excel_input_edit.text().strip()))
+        for widget in (
+            self._excel_input_btn,
+            self._excel_output_btn,
+            self._excel_input_edit,
+            self._excel_output_edit,
+        ):
+            widget.setEnabled(not running)
+
+    def _update_excel_run_state(self) -> None:
+        if self._excel_worker is not None:
+            return
+        has_input = bool(self._excel_input_edit.text().strip())
+        self._excel_run_btn.setEnabled(has_input)
 
     def _detect_sequence(self, frame_path: Path) -> SequenceInfo | None:
         match = re.match(r"(.*?)(\d+)(\.[^.]+)$", frame_path.name)
