@@ -43,7 +43,7 @@ from converter import (
     probe_image_metadata,
     probe_video_metadata,
 )
-from process_excel import process_excel as execute_excel_template
+from process_excel import DEFAULT_TEMPLATE, process_excel as execute_excel_template
 
 
 QUALITY_OPTIONS = [
@@ -160,16 +160,29 @@ class ExcelWorker(QThread):
     error_signal = Signal(str)
     finished_signal = Signal()
 
-    def __init__(self, input_path: str, output_path: Optional[str]):
+    def __init__(
+        self,
+        input_path: str,
+        output_path: Optional[str],
+        template_text: Optional[str],
+        template_path: Optional[str] = None,
+    ):
         super().__init__()
         self._input_path = input_path
         self._output_path = output_path
+        self._template_text = template_text
+        self._template_path = template_path
 
     def run(self) -> None:  # pragma: no cover - UI thread
         stream = _ExcelLogStream(self.log_signal.emit)
         try:
             with redirect_stdout(stream):
-                execute_excel_template(self._input_path, self._output_path or None)
+                execute_excel_template(
+                    self._input_path,
+                    self._output_path or None,
+                    template_file=self._template_path or None,
+                    template_text=self._template_text or None,
+                )
             stream.flush()
             self.success_signal.emit("✅ Excel 模板填充完成")
         except SystemExit as exc:
@@ -188,7 +201,11 @@ class ExcelWorker(QThread):
 
 
 class FileDropLineEdit(QLineEdit):
-    def __init__(self, filters: Optional[Iterable[str]] = None, parent: QWidget | None = None):
+    def __init__(
+        self,
+        filters: Optional[Iterable[str]] = None,
+        parent: QWidget | None = None,
+    ):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self._filters = tuple(f.lower() for f in filters) if filters else ()
@@ -302,8 +319,15 @@ class MainWindow(QWidget):
         self._excel_log_view.setReadOnly(True)
         self._excel_run_btn.setEnabled(False)
         self._excel_output_edit.setPlaceholderText("留空则覆盖输入文件")
+        self._excel_template_edit = QTextEdit()
+        self._excel_template_edit.setPlaceholderText("留空使用默认模板")
+        self._excel_template_edit.setMinimumHeight(160)
+        self._excel_template_import_btn = QPushButton("导入模板")
+        self._excel_template_reset_btn = QPushButton("恢复默认模板")
 
         self._excel_worker: ExcelWorker | None = None
+        self._excel_template_path: Optional[str] = None
+        self._excel_template_updating = False
 
         self._setup_tabs()
         self._bind_events()
@@ -391,6 +415,13 @@ class MainWindow(QWidget):
         form_layout.addWidget(QLabel("输出文件"), 1, 0)
         form_layout.addWidget(self._excel_output_edit, 1, 1)
         form_layout.addWidget(self._excel_output_btn, 1, 2)
+        form_layout.addWidget(QLabel("模板内容"), 2, 0, 1, 1)
+        form_layout.addWidget(self._excel_template_edit, 2, 1, 3, 1)
+        buttons_layout = QVBoxLayout()
+        buttons_layout.addWidget(self._excel_template_import_btn)
+        buttons_layout.addWidget(self._excel_template_reset_btn)
+        buttons_layout.addStretch(1)
+        form_layout.addLayout(buttons_layout, 2, 2, 3, 1)
         form_group.setLayout(form_layout)
 
         log_group = QGroupBox("日志")
@@ -420,9 +451,12 @@ class MainWindow(QWidget):
         self._cancel_btn.clicked.connect(self._on_cancel)  # type: ignore[arg-type]
         self._excel_input_btn.clicked.connect(self._on_excel_browse_input)  # type: ignore[arg-type]
         self._excel_output_btn.clicked.connect(self._on_excel_browse_output)  # type: ignore[arg-type]
+        self._excel_template_import_btn.clicked.connect(self._on_excel_import_template)  # type: ignore[arg-type]
+        self._excel_template_reset_btn.clicked.connect(self._on_excel_reset_template)  # type: ignore[arg-type]
         self._excel_run_btn.clicked.connect(self._on_excel_run)  # type: ignore[arg-type]
         self._excel_input_edit.textChanged.connect(self._update_excel_run_state)  # type: ignore[arg-type]
         self._excel_output_edit.textChanged.connect(self._update_excel_run_state)  # type: ignore[arg-type]
+        self._excel_template_edit.textChanged.connect(self._on_excel_template_changed)  # type: ignore[arg-type]
 
     def _on_add_files(self) -> None:  # pragma: no cover - UI
         paths, _ = QFileDialog.getOpenFileNames(
@@ -748,12 +782,44 @@ class MainWindow(QWidget):
         if path:
             self._excel_output_edit.setText(path)
 
+    def _on_excel_import_template(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 HTML 模板",
+            "",
+            "HTML 模板 (*.html *.htm *.txt);;所有文件 (*)",
+        )
+        if path:
+            try:
+                with open(path, "r", encoding="utf-8") as file:
+                    content = file.read()
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(self, "读取失败", f"无法读取模板文件：{exc}")
+                return
+            self._excel_template_updating = True
+            self._excel_template_edit.setPlainText(content)
+            self._excel_template_updating = False
+            self._excel_template_path = path
+
+    def _on_excel_reset_template(self) -> None:
+        self._excel_template_updating = True
+        self._excel_template_edit.setPlainText(DEFAULT_TEMPLATE)
+        self._excel_template_updating = False
+        self._excel_template_path = None
+
+    def _on_excel_template_changed(self) -> None:
+        if self._excel_template_updating:
+            return
+        self._excel_template_path = None
+
     def _on_excel_run(self) -> None:
         if self._excel_worker is not None:
             return
 
         input_path = self._excel_input_edit.text().strip()
         output_path = self._excel_output_edit.text().strip() or None
+        raw_template_text = self._excel_template_edit.toPlainText()
+        template_text = raw_template_text if raw_template_text.strip() else None
 
         if not input_path:
             QMessageBox.warning(self, "参数错误", "请选择需要处理的 Excel 文件")
@@ -762,7 +828,12 @@ class MainWindow(QWidget):
         self._excel_log_view.clear()
         self._set_excel_controls_running(True)
 
-        self._excel_worker = ExcelWorker(input_path, output_path)
+        self._excel_worker = ExcelWorker(
+            input_path,
+            output_path,
+            template_text,
+            self._excel_template_path,
+        )
         self._excel_worker.log_signal.connect(self._append_excel_log)
         self._excel_worker.error_signal.connect(self._on_excel_error)
         self._excel_worker.success_signal.connect(self._on_excel_success)
@@ -792,6 +863,9 @@ class MainWindow(QWidget):
             self._excel_output_btn,
             self._excel_input_edit,
             self._excel_output_edit,
+            self._excel_template_edit,
+            self._excel_template_import_btn,
+            self._excel_template_reset_btn,
         ):
             widget.setEnabled(not running)
 
