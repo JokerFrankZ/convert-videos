@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 """
-读取 Excel 文件，按指定 HTML 模板填充占位符，在第三列写入描述、第四列写入结果
+读取 Excel 文件，首行作为模板变量定义，使用 HTML 模板生成结果列
 """
 
 import argparse
 import os
 import sys
+import re
 
 import openpyxl
 
 DEFAULT_TEMPLATE = """<p>{desc}</p><p>{name}</p><p>{price}</p><p>【具体价格请咨询商家】</p><p><br></p><p>不只是卖花，更是传递思念与欢喜，让每一份情感都有处安放。</p><p><br></p><p><img alt="图片上传" src="https://jmy-pic.baidu.com/0/pic/-1385074748_501952671_1241745945.jpg" class="fr-fic fr-dii"></p><p><img alt="图片上传" src="https://jmy-pic.baidu.com/0/pic/1850010481_-13527842_504047256.jpg" class="fr-fic fr-dii"></p><p><img alt="图片上传" src="https://jmy-pic.baidu.com/0/pic/-484983576_678918380_-191833468.jpg" class="fr-fic fr-dii"></p>"""
+RESULT_HEADER = "生成结果"
 
 
 def _load_template_from_file(template_path: str) -> str:
@@ -37,25 +39,35 @@ def _resolve_template(template_text: str | None, template_path: str | None) -> s
     return DEFAULT_TEMPLATE
 
 
-def _ensure_desc_column(sheet) -> bool:
-    """确保第3列用于描述，如第3列已有HTML结果则插入新列。"""
-    has_html = False
-    sample_rows = min(sheet.max_row, 50) or 1
-    for row in range(1, sample_rows + 1):
-        value = sheet.cell(row=row, column=3).value
-        if isinstance(value, str) and "<" in value:
-            has_html = True
-            break
+def _build_header_mapping(sheet) -> dict[str, int]:
+    mapping: dict[str, int] = {}
+    max_col = sheet.max_column
+    for col in range(1, max_col + 1):
+        header_value = sheet.cell(row=1, column=col).value
+        if header_value is None:
+            continue
+        header_str = str(header_value).strip()
+        if not header_str or header_str == RESULT_HEADER:
+            continue
+        if header_str in mapping:
+            print(f"警告：变量 '{header_str}' 重复，仅保留第一列。")
+            continue
+        mapping[header_str] = col
+    if not mapping:
+        print("错误：首行未定义任何模板变量。")
+        sys.exit(1)
+    return mapping
 
-    if has_html:
-        sheet.insert_cols(3)
-        if sheet.cell(row=1, column=3).value in (None, ""):
-            sheet.cell(row=1, column=3, value="描述")
-        return True
 
-    if sheet.cell(row=1, column=3).value in (None, ""):
-        sheet.cell(row=1, column=3, value="描述")
-    return False
+_PLACEHOLDER_PATTERN = re.compile(r"{([^{}]+)}")
+
+
+def _render_template(template: str, values: dict[str, str]) -> str:
+    def replacer(match: re.Match) -> str:
+        key = match.group(1)
+        return values.get(key, "")
+
+    return _PLACEHOLDER_PATTERN.sub(replacer, template)
 
 
 def process_excel(input_file, output_file=None, template_file=None, template_text=None):
@@ -85,31 +97,32 @@ def process_excel(input_file, output_file=None, template_file=None, template_tex
         sheet = workbook.active
 
         template_content = _resolve_template(template_text, template_file)
-        inserted_desc = _ensure_desc_column(sheet)
-        if inserted_desc:
-            print("提示：已自动插入“描述”列，原结果列已后移。")
+        header_mapping = _build_header_mapping(sheet)
+
+        result_column = sheet.max_column + 1
+        sheet.cell(row=1, column=result_column, value=RESULT_HEADER)
 
         processed_count = 0
 
-        # 遍历所有行（从第1行开始）
-        for row in range(1, sheet.max_row + 1):
-            name = sheet.cell(row=row, column=1).value
-            price = sheet.cell(row=row, column=2).value
-            desc = sheet.cell(row=row, column=3).value
+        # 遍历数据行（从第2行开始）
+        for row in range(2, sheet.max_row + 1):
+            values: dict[str, str] = {}
+            non_empty = False
+            for key, col in header_mapping.items():
+                cell_value = sheet.cell(row=row, column=col).value
+                if cell_value is None:
+                    values[key] = ""
+                else:
+                    non_empty = True
+                    values[key] = str(cell_value)
 
-            if name is None and price is None and desc is None:
+            if not non_empty:
                 continue
 
-            # 替换模板中的占位符（缺失值视为"")
-            result = (
-                template_content.replace("{name}", "" if name is None else str(name))
-                .replace("{price}", "" if price is None else str(price))
-                .replace("{desc}", "" if desc is None else str(desc))
-            )
+            result = _render_template(template_content, values)
 
-            # 将结果写入第四列
-            sheet.cell(row=row, column=4, value=result)
-            print(f"处理第 {row} 行: name={name}, price={price}, desc={desc}")
+            sheet.cell(row=row, column=result_column, value=result)
+            print(f"处理第 {row} 行: {values}")
             processed_count += 1
 
         # 保存文件
@@ -126,7 +139,7 @@ def process_excel(input_file, output_file=None, template_file=None, template_tex
 def main():
     """主函数，处理命令行参数"""
     parser = argparse.ArgumentParser(
-        description="读取 Excel 文件，替换 HTML 模板中的占位符，第三列写入描述，第四列写入结果",
+        description="读取 Excel 文件，首行定义模板变量，使用 HTML 模板生成结果列",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
