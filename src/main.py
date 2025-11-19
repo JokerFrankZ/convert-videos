@@ -43,7 +43,13 @@ from converter import (
     probe_image_metadata,
     probe_video_metadata,
 )
-from process_excel import DEFAULT_TEMPLATE, process_excel as execute_excel_template
+from openpyxl import load_workbook
+
+from process_excel import (
+    DEFAULT_TEMPLATE,
+    RESULT_HEADER,
+    process_excel as execute_excel_template,
+)
 
 
 QUALITY_OPTIONS = [
@@ -324,6 +330,10 @@ class MainWindow(QWidget):
         self._excel_template_edit.setMinimumHeight(160)
         self._excel_template_import_btn = QPushButton("导入模板")
         self._excel_template_reset_btn = QPushButton("恢复默认模板")
+        self._excel_variables_list = QListWidget()
+        self._excel_variables_hint = QLabel("双击变量名可插入模板占位符。")
+        self._excel_variables_hint.setWordWrap(True)
+        self._excel_variables_list.addItem("请选择 Excel 输入文件以加载变量")
 
         self._excel_worker: ExcelWorker | None = None
         self._excel_template_path: Optional[str] = None
@@ -424,6 +434,12 @@ class MainWindow(QWidget):
         form_layout.addLayout(buttons_layout, 2, 2, 3, 1)
         form_group.setLayout(form_layout)
 
+        variables_group = QGroupBox("可用模板变量")
+        variables_layout = QVBoxLayout()
+        variables_layout.addWidget(self._excel_variables_list)
+        variables_layout.addWidget(self._excel_variables_hint)
+        variables_group.setLayout(variables_layout)
+
         log_group = QGroupBox("日志")
         log_layout = QVBoxLayout()
         log_layout.addWidget(self._excel_log_view)
@@ -434,6 +450,7 @@ class MainWindow(QWidget):
         control_layout.addWidget(self._excel_run_btn)
 
         main_layout.addWidget(form_group)
+        main_layout.addWidget(variables_group)
         main_layout.addWidget(log_group)
         main_layout.addLayout(control_layout)
         main_layout.addStretch(1)
@@ -454,7 +471,8 @@ class MainWindow(QWidget):
         self._excel_template_import_btn.clicked.connect(self._on_excel_import_template)  # type: ignore[arg-type]
         self._excel_template_reset_btn.clicked.connect(self._on_excel_reset_template)  # type: ignore[arg-type]
         self._excel_run_btn.clicked.connect(self._on_excel_run)  # type: ignore[arg-type]
-        self._excel_input_edit.textChanged.connect(self._update_excel_run_state)  # type: ignore[arg-type]
+        self._excel_variables_list.itemDoubleClicked.connect(self._on_excel_variable_double_clicked)  # type: ignore[arg-type]
+        self._excel_input_edit.textChanged.connect(self._on_excel_input_changed)  # type: ignore[arg-type]
         self._excel_output_edit.textChanged.connect(self._update_excel_run_state)  # type: ignore[arg-type]
         self._excel_template_edit.textChanged.connect(self._on_excel_template_changed)  # type: ignore[arg-type]
 
@@ -866,8 +884,74 @@ class MainWindow(QWidget):
             self._excel_template_edit,
             self._excel_template_import_btn,
             self._excel_template_reset_btn,
+            self._excel_variables_list,
         ):
             widget.setEnabled(not running)
+
+    def _on_excel_input_changed(self) -> None:
+        self._update_excel_run_state()
+        self._update_excel_variables()
+
+    def _update_excel_variables(self) -> None:
+        path = self._excel_input_edit.text().strip()
+        self._excel_variables_list.clear()
+        if not path:
+            self._excel_variables_list.addItem("请先选择 Excel 输入文件")
+            return
+
+        file_path = Path(path)
+        if not file_path.exists():
+            self._excel_variables_list.addItem("⚠️ 文件不存在")
+            return
+
+        try:
+            workbook = load_workbook(str(file_path), read_only=True, data_only=True)
+        except Exception as exc:  # noqa: BLE001
+            self._excel_variables_list.addItem(f"⚠️ 读取失败: {exc}")
+            return
+
+        try:
+            sheet = workbook.active
+            headers: list[str] = []
+            duplicates: set[str] = set()
+            for col in range(1, sheet.max_column + 1):
+                value = sheet.cell(row=1, column=col).value
+                if value is None:
+                    continue
+                header = str(value).strip()
+                if not header or header == RESULT_HEADER:
+                    continue
+                if header in headers:
+                    duplicates.add(header)
+                    continue
+                headers.append(header)
+        finally:
+            workbook.close()
+
+        if not headers:
+            self._excel_variables_list.addItem("⚠️ 首行未检测到模板变量")
+            return
+
+        for header in headers:
+            item = QListWidgetItem(header)
+            item.setData(Qt.ItemDataRole.UserRole, header)
+            self._excel_variables_list.addItem(item)
+
+        if duplicates:
+            note = f"⚠️ 重复变量已忽略: {', '.join(sorted(duplicates))}"
+            warning_item = QListWidgetItem(note)
+            warning_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            warning_item.setData(Qt.ItemDataRole.UserRole, None)
+            self._excel_variables_list.addItem(warning_item)
+
+    def _on_excel_variable_double_clicked(self, item: QListWidgetItem) -> None:
+        header = item.data(Qt.ItemDataRole.UserRole)
+        if not header:
+            return
+        cursor = self._excel_template_edit.textCursor()
+        cursor.insertText(f"{{{header}}}")
+        self._excel_template_edit.setTextCursor(cursor)
+        self._excel_template_edit.setFocus()
 
     def _update_excel_run_state(self) -> None:
         if self._excel_worker is not None:
