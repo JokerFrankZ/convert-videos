@@ -8,8 +8,16 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Iterable, List, NamedTuple, Optional
 
-from PySide6.QtCore import Qt, QMimeData, QThread, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QTextCursor
+from PySide6.QtCore import Qt, QMimeData, QThread, QRegularExpression, Signal
+from PySide6.QtGui import (
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QSyntaxHighlighter,
+    QTextCharFormat,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -206,6 +214,83 @@ class ExcelWorker(QThread):
             self.finished_signal.emit()
 
 
+class HTMLTemplateHighlighter(QSyntaxHighlighter):
+    """HTML模板语法高亮器，支持HTML标签和变量占位符高亮。"""
+
+    def __init__(self, document):
+        super().__init__(document)
+
+        # 定义高亮格式
+        # 变量占位符格式 {variable}
+        self.variable_format = QTextCharFormat()
+        self.variable_format.setForeground(QColor("#FF6B6B"))  # 红色
+        self.variable_format.setFontWeight(QFont.Bold)
+
+        # HTML标签格式 <tag>
+        self.tag_format = QTextCharFormat()
+        self.tag_format.setForeground(QColor("#4ECDC4"))  # 青色
+        self.tag_format.setFontWeight(QFont.Bold)
+
+        # HTML属性名格式
+        self.attribute_name_format = QTextCharFormat()
+        self.attribute_name_format.setForeground(QColor("#95E1D3"))  # 浅青色
+
+        # HTML属性值格式
+        self.attribute_value_format = QTextCharFormat()
+        self.attribute_value_format.setForeground(QColor("#F38181"))  # 浅红色
+
+        # 定义正则表达式规则
+        self.highlighting_rules = []
+
+        # 变量占位符规则: {variable_name}
+        self.highlighting_rules.append((
+            QRegularExpression(r"\{[^{}]+\}"),
+            self.variable_format
+        ))
+
+        # HTML标签规则: <tag> </tag> <tag/>
+        self.highlighting_rules.append((
+            QRegularExpression(r"</?[a-zA-Z][a-zA-Z0-9]*(?:\s|/?>)"),
+            self.tag_format
+        ))
+
+        # HTML标签结束符 >
+        self.highlighting_rules.append((
+            QRegularExpression(r"/?>"),
+            self.tag_format
+        ))
+
+        # HTML属性名规则
+        self.highlighting_rules.append((
+            QRegularExpression(r'\b[a-zA-Z-]+(?==)'),
+            self.attribute_name_format
+        ))
+
+        # HTML属性值规则（双引号）
+        self.highlighting_rules.append((
+            QRegularExpression(r'"[^"]*"'),
+            self.attribute_value_format
+        ))
+
+        # HTML属性值规则（单引号）
+        self.highlighting_rules.append((
+            QRegularExpression(r"'[^']*'"),
+            self.attribute_value_format
+        ))
+
+    def highlightBlock(self, text: str) -> None:
+        """对文本块应用语法高亮。"""
+        for pattern, format_style in self.highlighting_rules:
+            match_iterator = pattern.globalMatch(text)
+            while match_iterator.hasNext():
+                match = match_iterator.next()
+                self.setFormat(
+                    match.capturedStart(),
+                    match.capturedLength(),
+                    format_style
+                )
+
+
 class FileDropLineEdit(QLineEdit):
     def __init__(
         self,
@@ -328,6 +413,15 @@ class MainWindow(QWidget):
         self._excel_template_edit = QTextEdit()
         self._excel_template_edit.setPlaceholderText("留空使用默认模板")
         self._excel_template_edit.setMinimumHeight(160)
+        # 设置等宽字体以提升代码可读性
+        code_font = QFont("Menlo")
+        code_font.setStyleHint(QFont.Monospace)
+        code_font.setPointSize(12)
+        self._excel_template_edit.setFont(code_font)
+        # 应用语法高亮器
+        self._excel_template_highlighter = HTMLTemplateHighlighter(
+            self._excel_template_edit.document()
+        )
         self._excel_template_import_btn = QPushButton("导入模板")
         self._excel_template_reset_btn = QPushButton("恢复默认模板")
         self._excel_variables_list = QListWidget()
